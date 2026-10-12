@@ -40,17 +40,32 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
+    let workspace_root = normalize_for_comparison(workspace_root);
+    let comparable = normalize_for_comparison(resolved);
+    if comparable.starts_with(&workspace_root) || resolves_within(resolved, &workspace_root) {
+        return Ok(());
     }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "path {} escapes workspace boundary {}",
+            comparable.display(),
+            workspace_root.display()
+        ),
+    ))
+}
+
+/// Whether `resolved` names a location inside `workspace_root` once the
+/// filesystem resolves it. Windows accepts several spellings of one location
+/// that [`Path::starts_with`] treats as different: letter case (a working
+/// directory typed as `c:\users\...` for `C:\Users\...`), the `\\.\` device
+/// namespace, and 8.3 short names. Only consulted after the lexical comparison
+/// fails, so it can accept such a spelling but never widens what already
+/// compared inside, and a path whose canonical form is outside stays rejected.
+fn resolves_within(resolved: &Path, workspace_root: &Path) -> bool {
+    resolved
+        .canonicalize()
+        .is_ok_and(|canonical| normalize_for_comparison(&canonical).starts_with(workspace_root))
 }
 
 /// Text payload returned by file-reading operations.
@@ -527,9 +542,29 @@ fn build_grep_content_output(
 }
 
 fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
-    workspace_root
+    let canonical = workspace_root
         .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf())
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    normalize_for_comparison(&canonical)
+}
+
+/// Normalize Windows' extended-length path prefix before comparing paths.
+///
+/// `std::fs::canonicalize` returns paths with a `\\?\` prefix on Windows,
+/// while a workspace root may still be represented as a regular path when it
+/// cannot be canonicalized (for example, while a workspace is bootstrapping).
+/// These paths refer to the same location but do not compare equal with
+/// [`Path::starts_with`]. Keep the comparison representation stable without
+/// changing the paths returned to callers.
+fn normalize_for_comparison(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc_path) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc_path}"));
+    }
+    if let Some(dos_path) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(dos_path);
+    }
+    path.to_path_buf()
 }
 
 fn should_skip_glob_dir(entry: &DirEntry) -> bool {
@@ -777,8 +812,9 @@ mod tests {
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_symlink_escape, normalize_for_comparison, read_file,
+        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -904,6 +940,86 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn normalizes_windows_extended_length_prefixes_for_boundary_checks() {
+        let dos_path = PathBuf::from(r"C:\workspace\file.txt");
+        let extended_dos_path = PathBuf::from(r"\\?\C:\workspace\file.txt");
+        assert_eq!(
+            normalize_for_comparison(&extended_dos_path),
+            dos_path,
+            "extended DOS paths should compare like their regular form"
+        );
+
+        let unc_path = PathBuf::from(r"\\server\share\workspace\file.txt");
+        let extended_unc_path = PathBuf::from(r"\\?\UNC\server\share\workspace\file.txt");
+        assert_eq!(
+            normalize_for_comparison(&extended_unc_path),
+            unc_path,
+            "extended UNC paths should compare like their regular form"
+        );
+    }
+
+    // Backslash-separated paths only parse into path components on Windows.
+    #[test]
+    #[cfg(windows)]
+    fn accepts_equivalent_extended_path_at_workspace_boundary() {
+        let root = PathBuf::from(r"C:\workspace");
+        let resolved = PathBuf::from(r"\\?\C:\workspace\src\main.rs");
+        super::validate_workspace_boundary(&resolved, &root)
+            .expect("equivalent Windows path representations should be accepted");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepts_a_path_that_resolves_inside_the_workspace() {
+        let workspace = temp_path("boundary-alias-workspace");
+        let aliases = temp_path("boundary-alias-links");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace dir should be created");
+        std::fs::create_dir_all(&aliases).expect("alias dir should be created");
+        let alias = aliases.join("src");
+        std::os::unix::fs::symlink(workspace.join("src"), &alias).expect("symlink should create");
+        let root = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        super::validate_workspace_boundary(&alias, &root)
+            .expect("a spelling that resolves inside the workspace should be accepted");
+        super::validate_workspace_boundary(&aliases, &root)
+            .expect_err("a path that resolves outside the workspace must stay rejected");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&aliases);
+    }
+
+    // Windows resolves one location from spellings that compare unequal as
+    // paths, letter case and the `\\.\` device namespace among them.
+    #[test]
+    #[cfg(windows)]
+    fn accepts_other_windows_spellings_of_a_workspace_path() {
+        let workspace = temp_path("Boundary-Case-Workspace");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace dir should be created");
+        let root = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        let lower = PathBuf::from(workspace.join("src").to_string_lossy().to_lowercase());
+        super::validate_workspace_boundary(&lower, &root)
+            .expect("a lower-cased spelling of a workspace path should be accepted");
+
+        let device = PathBuf::from(format!(r"\\.\{}", workspace.join("src").display()));
+        super::validate_workspace_boundary(&device, &root)
+            .expect("a device-namespace spelling of a workspace path should be accepted");
+
+        let parent = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .to_path_buf();
+        super::validate_workspace_boundary(&parent, &root)
+            .expect_err("the workspace's parent must stay rejected");
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

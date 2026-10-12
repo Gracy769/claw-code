@@ -130,7 +130,7 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
 }
 
 #[test]
-fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
+fn text_prompt_mode_streams_assistant_text_once_before_spinner_completion() {
     // given a workspace pointed at the mock Anthropic service running the
     // streaming_text scenario which only emits a single assistant text block
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -162,7 +162,7 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
         ],
     );
 
-    // then stdout should contain the final assistant text, not just spinner output
+    // then the streamed answer should appear once before the spinner completion
     assert!(
         output.status.success(),
         "text prompt run should succeed\nstdout:\n{}\n\nstderr:\n{}",
@@ -171,19 +171,19 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let plain_stdout = strip_ansi_codes(&stdout);
-    assert!(
-        plain_stdout.contains("Mock streaming says hello from the parity harness."),
-        "text prompt stdout should include the assistant text ({stdout:?})"
+    let assistant_text = "Mock streaming says hello from the parity harness.";
+    assert_eq!(
+        plain_stdout.matches(assistant_text).count(),
+        1,
+        "text prompt stdout should contain the streamed assistant text exactly once ({stdout:?})"
     );
     assert!(
         plain_stdout.contains("✔ ✨ Done"),
         "text prompt stdout should still include spinner completion ({stdout:?})"
     );
     assert!(
-        plain_stdout
-            .lines()
-            .any(|line| line == "Mock streaming says hello from the parity harness."),
-        "text prompt stdout should print the assistant text as its own line ({stdout:?})"
+        plain_stdout.find(assistant_text) < plain_stdout.find("✔ ✨ Done"),
+        "text prompt stdout should stream the assistant text before spinner completion ({stdout:?})"
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
