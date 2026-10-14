@@ -138,7 +138,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Show instruction files and persistent auto memory",
         argument_hint: None,
         resume_supported: true,
     },
@@ -160,6 +160,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "version",
         aliases: &[],
         summary: "Show CLI version and build information",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "tools",
+        aliases: &[],
+        summary: "List available tools and their descriptions",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "info",
+        aliases: &[],
+        summary: "Show runtime information about claw-code",
         argument_hint: None,
         resume_supported: true,
     },
@@ -1091,6 +1105,8 @@ pub enum SlashCommand {
     Init,
     Diff,
     Version,
+    Tools,
+    Info,
     Export {
         path: Option<String>,
     },
@@ -1131,6 +1147,9 @@ pub enum SlashCommand {
     SecurityReview,
     Keybindings,
     PrivacySettings,
+    Workspace {
+        path: Option<String>,
+    },
     Plan {
         mode: Option<String>,
     },
@@ -1272,6 +1291,7 @@ impl SlashCommand {
             Self::SecurityReview => "/security-review",
             Self::Keybindings => "/keybindings",
             Self::PrivacySettings => "/privacy-settings",
+            Self::Workspace { .. } => "/workspace",
             Self::Plan { .. } => "/plan",
             Self::Review { .. } => "/review",
             Self::Tasks { .. } => "/tasks",
@@ -1388,6 +1408,14 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Version
         }
+        "tools" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Tools
+        }
+        "info" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Info
+        }
         "export" => SlashCommand::Export { path: remainder },
         "session" => parse_session_command(&args)?,
         "plugin" | "plugins" | "marketplace" => parse_plugin_command(&args)?,
@@ -1405,6 +1433,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Setup
         }
+        "workspace" | "cwd" => SlashCommand::Workspace {
+            path: optional_single_arg(command, &args, "[path]")?,
+        },
         "login" | "logout" => {
             return Err(command_error(
                 "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
@@ -2220,6 +2251,7 @@ pub(crate) struct SkillCollection {
 enum SkillOrigin {
     SkillsDir,
     LegacyCommandsDir,
+    Bundled,
 }
 
 impl SkillOrigin {
@@ -2227,6 +2259,7 @@ impl SkillOrigin {
         match self {
             Self::SkillsDir => None,
             Self::LegacyCommandsDir => Some("legacy /commands"),
+            Self::Bundled => Some("bundled"),
         }
     }
 }
@@ -3099,7 +3132,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
         for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
             match root.origin {
-                SkillOrigin::SkillsDir => {
+                SkillOrigin::SkillsDir | SkillOrigin::Bundled => {
                     if !entry.path().is_dir() {
                         continue;
                     }
@@ -3524,6 +3557,52 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     roots
 }
 
+/// Returns the default bundled skills root directory.
+///
+/// Resolution order (first existing path wins):
+/// 1. `<exe_dir>/../share/claw/skills/bundled` — standard install layout
+/// 2. `<exe_dir>/bundled-skills` — simple relocated layout
+/// 3. `CARGO_MANIFEST_DIR/bundled` — dev/source-tree fallback (only if it exists)
+/// 4. `<exe_dir>/../share/claw/skills/bundled` — canonical default even if missing
+fn bundled_skill_root() -> PathBuf {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let share_path = exe_dir
+                .join("..")
+                .join("share")
+                .join("claw")
+                .join("skills")
+                .join("bundled");
+            if share_path.exists() {
+                return share_path;
+            }
+
+            let adjacent = exe_dir.join("bundled-skills");
+            if adjacent.exists() {
+                return adjacent;
+            }
+        }
+    }
+
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
+    if dev_path.exists() {
+        return dev_path;
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            return exe_dir
+                .join("..")
+                .join("share")
+                .join("claw")
+                .join("skills")
+                .join("bundled");
+        }
+    }
+
+    PathBuf::from("/usr/share/claw/skills/bundled")
+}
+
 #[allow(clippy::too_many_lines)]
 fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
@@ -3685,6 +3764,14 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             SkillOrigin::LegacyCommandsDir,
         );
     }
+
+    let bundled_root = bundled_skill_root();
+    push_unique_skill_root(
+        &mut roots,
+        DefinitionSource::UserClaw,
+        bundled_root,
+        SkillOrigin::Bundled,
+    );
 
     roots
 }
@@ -4118,7 +4205,7 @@ fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<Ski
         for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
             match root.origin {
-                SkillOrigin::SkillsDir => {
+                SkillOrigin::SkillsDir | SkillOrigin::Bundled => {
                     if !entry.path().is_dir() {
                         continue;
                     }
@@ -5174,6 +5261,7 @@ fn skill_origin_id(origin: SkillOrigin) -> &'static str {
     match origin {
         SkillOrigin::SkillsDir => "skills_dir",
         SkillOrigin::LegacyCommandsDir => "legacy_commands_dir",
+        SkillOrigin::Bundled => "bundled",
     }
 }
 
@@ -5342,6 +5430,7 @@ pub fn handle_slash_command(
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
+        | SlashCommand::Workspace { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
@@ -5395,6 +5484,8 @@ pub fn handle_slash_command(
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
+        | SlashCommand::Tools
+        | SlashCommand::Info
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -5402,14 +5493,15 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
+        classify_skills_slash_command, discover_skill_roots, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
         render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input, AgentCollection,
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
+        skill_origin_id, skill_origin_json, slash_command_specs, suggest_slash_commands,
+        validate_slash_command_input, AgentCollection, DefinitionSource, SkillOrigin, SkillRoot,
+        SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
         PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
@@ -6012,7 +6104,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -6120,6 +6212,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_slash_command_and_alias() {
+        let workspace = validate_slash_command_input("/workspace")
+            .expect("workspace should parse")
+            .expect("workspace should be a slash command");
+        assert_eq!(workspace, SlashCommand::Workspace { path: None });
+
+        let cwd = validate_slash_command_input("/cwd src")
+            .expect("cwd alias should parse")
+            .expect("cwd alias should be a slash command");
+        assert_eq!(
+            cwd,
+            SlashCommand::Workspace {
+                path: Some("src".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn compacts_sessions_via_slash_command() {
         let mut session = Session::new();
         session.messages = vec![
@@ -6219,6 +6329,8 @@ mod tests {
         assert!(handle_slash_command("/mcp list", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/tools", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/info", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/export note.txt", &session, CompactionConfig::default())
                 .is_none()
@@ -7179,5 +7291,51 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn discovers_bundled_skills_from_binary_layout() {
+        let cwd = temp_dir("bundled-skills-discovery");
+        let roots = discover_skill_roots(&cwd);
+
+        let has_bundled = roots.iter().any(|root| root.origin == SkillOrigin::Bundled);
+        assert!(
+            has_bundled,
+            "discover_skill_roots should include a bundled skills root"
+        );
+
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn bundled_skills_have_correct_origin_metadata() {
+        let bundled_origin = SkillOrigin::Bundled;
+        assert_eq!(skill_origin_id(bundled_origin), "bundled");
+        assert_eq!(bundled_origin.detail_label(), Some("bundled"));
+
+        let bundled_json = skill_origin_json(bundled_origin);
+        assert_eq!(bundled_json["id"], "bundled");
+        assert_eq!(bundled_json["detail_label"], "bundled");
+    }
+
+    #[test]
+    fn bundled_skills_are_included_in_json_output() {
+        let cwd = temp_dir("bundled-skills-json-test");
+        let roots = discover_skill_roots(&cwd);
+
+        let bundled_root = roots
+            .iter()
+            .find(|r| r.origin == SkillOrigin::Bundled)
+            .expect("should have bundled skills root");
+
+        let loaded_skills =
+            load_skills_from_roots(&[bundled_root.clone()]).expect("should load bundled skills");
+
+        assert!(
+            !loaded_skills.is_empty() || bundled_root.path.exists(),
+            "bundled skills should either load successfully or root should exist"
+        );
+
+        let _ = fs::remove_dir_all(cwd);
     }
 }

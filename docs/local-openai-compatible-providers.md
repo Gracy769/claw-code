@@ -2,7 +2,7 @@
 
 This guide covers two common offline/local workflows:
 
-1. running Claw against an OpenAI-compatible local model server such as Ollama, llama.cpp, or vLLM; and
+1. running Claw against an OpenAI-compatible local model server such as Ollama, LM Studio, llama.cpp, or vLLM; and
 2. installing local skills from disk so Claw can discover them without network access.
 
 ## Claw is not Claude-only
@@ -25,7 +25,8 @@ Routing notes:
 
 - Use the `openai/` prefix for OpenAI-compatible gateways when you need prefix routing to win over ambient Anthropic credentials, for example `--model "openai/gpt-4.1-mini"` with OpenRouter.
 - For local servers, prefer the exact model ID reported by the server (`qwen3:latest`, `llama3.2`, etc.). If your local gateway exposes slash-containing IDs, prefix the exact slug with `local/` so Claw routes through OpenAI-compatible transport while sending the rest verbatim, for example `--model "local/Qwen/Qwen2.5-Coder-7B-Instruct"`.
-- If you have multiple provider keys in your environment, `OPENAI_BASE_URL` plus local-looking tags such as `llama3.2` or `qwen2.5-coder:7b` selects the local OpenAI-compatible route; use `local/` for slash-containing local IDs.
+- When `OPENAI_BASE_URL` points at a loopback or private-network address (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `172.16-31.x`), Claw accepts **any** non-empty model name — bare aliases like `mistral` work with no dot, colon, or slash required. This covers LM Studio and llama.cpp server setups that register models under a plain `--alias`, not just Ollama-style tagged names (`llama3.2`, `qwen2.5-coder:7b`). `local/` is still needed only to preserve slash-containing IDs verbatim (e.g. Hugging Face repo IDs for vLLM/mlx-lm).
+- Against a remote/hosted OpenAI-compatible gateway (not local/private), Claw keeps the stricter `provider/model` or dot/colon-tag requirement so a mistyped bare name doesn't silently route to a paid hosted API.
 - Tool workflows need model/server support for OpenAI-compatible tool calls. Plain prompt smoke tests can pass even when slash/tool workflows still fail because the server returns an incompatible tool-call shape.
 
 ## Raw `/v1/chat/completions` smoke test
@@ -81,6 +82,17 @@ export OPENAI_API_KEY="local-dev-token"
 claw --model "qwen2.5-coder" prompt "Reply exactly HELLO_WORLD_123"
 ```
 
+## LM Studio
+
+Start LM Studio's local server (Developer tab → Start Server, default port `1234`), or headless via `lms server start`. LM Studio commonly serves models under a bare alias with no dot or colon (for example `mistral-7b-instruct` or a custom name set in the model settings).
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:1234/v1"
+claw --model "mistral-7b-instruct" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+`OPENAI_API_KEY` can stay unset for LM Studio's default authless local server. Use the exact model identifier LM Studio reports (check `curl $OPENAI_BASE_URL/models`) if the bare alias above doesn't match what you loaded.
+
 ## vLLM or another OpenAI-compatible server
 
 Start vLLM with an OpenAI-compatible API server:
@@ -117,6 +129,25 @@ claw --model "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" prompt "Reply exactl
 ```
 
 mlx-lm serves models under their full Hugging Face repo ID. Use the exact `id` field from `curl $OPENAI_BASE_URL/models` for `--model`. A bare name like `qwen2.5-coder-7b-instruct` will fail model resolution before the request ever reaches the server.
+
+## OmniRoute and other remote OpenAI-compatible gateways
+
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is a third-party OpenAI-compatible AI gateway that can route requests to multiple providers. To use any remote OpenAI-compatible gateway with Claw, set `OPENAI_BASE_URL` to the gateway's `/v1` endpoint and provide your API key:
+
+```bash
+export OPENAI_BASE_URL="https://api.omniroute.ai/v1"
+export OPENAI_API_KEY="your-omniroute-api-key"
+claw --model "gpt-4" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+To find the available model IDs on your gateway, use the `/models` endpoint:
+
+```bash
+curl -sS "$OPENAI_BASE_URL/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq '.data[].id'
+```
+
+For local configuration, see your gateway's documentation for the correct base URL, API key format, and available model IDs. The same OPENAI_BASE_URL + OPENAI_API_KEY pattern applies to any OpenAI-compatible remote gateway.
 
 ## Local skills install from disk
 

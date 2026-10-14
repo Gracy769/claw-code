@@ -110,13 +110,30 @@ Primary artifacts:
 
 ## Model Aliases
 
-Short names resolve to the latest model versions:
+Short model aliases resolve to canonical model IDs. Because the router selects a
+provider from the resolved model, an alias also determines which backend and
+credentials are used — choose the alias for the provider you have an API key for.
+Alias resolution is case-insensitive (`OPUS` behaves the same as `opus`). Aliases
+are the bare short names listed below: a prefixed form such as `anthropic/opus`
+is not an alias, and is passed through as-is rather than expanded to
+`claude-opus-4-7`.
 
-| Alias | Resolves To |
-|-------|------------|
-| `opus` | `claude-opus-4-7` |
-| `sonnet` | `claude-sonnet-4-6` |
-| `haiku` | `claude-haiku-4-5-20251213` |
+| Alias | Resolves To | Provider | Auth env var |
+|-------|-------------|----------|--------------|
+| `opus` | `claude-opus-4-7` | Anthropic | `ANTHROPIC_API_KEY` |
+| `sonnet` | `claude-sonnet-4-6` | Anthropic | `ANTHROPIC_API_KEY` |
+| `haiku` | `claude-haiku-4-5-20251213` | Anthropic | `ANTHROPIC_API_KEY` |
+| `grok`, `grok-3` | `grok-3` | xAI | `XAI_API_KEY` |
+| `grok-mini`, `grok-3-mini` | `grok-3-mini` | xAI | `XAI_API_KEY` |
+| `grok-2` | `grok-2` | xAI | `XAI_API_KEY` |
+| `kimi` | `kimi-k2.5` | DashScope (OpenAI-compatible) | `DASHSCOPE_API_KEY` |
+
+Anthropic aliases track the latest published model versions. xAI models honor
+`XAI_BASE_URL` and Kimi honors `DASHSCOPE_BASE_URL` for base-URL overrides. Alias
+resolution is implemented in `resolve_model_alias`
+([`crates/api/src/providers/mod.rs`](./crates/api/src/providers/mod.rs)); for
+provider-specific request handling see
+[`../docs/MODEL_COMPATIBILITY.md`](../docs/MODEL_COMPATIBILITY.md).
 
 ## CLI Flags and Commands
 
@@ -221,7 +238,7 @@ rust/
 ## Stats
 
 - **~20K lines** of Rust
-- **9 crates** in workspace
+- **11 crates** in workspace
 - **Binary name:** `claw`
 - **Default model:** `claude-opus-4-7`
 - **Default permissions:** `workspace-write`

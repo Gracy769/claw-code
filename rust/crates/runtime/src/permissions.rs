@@ -5,7 +5,10 @@ use serde_json::Value;
 use crate::config::RuntimePermissionRuleConfig;
 
 /// Permission level assigned to a tool invocation or runtime session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Deliberately **not** `PartialOrd`/`Ord`: see [`PermissionMode::privilege_rank`]
+/// for why ordering is a named function here rather than declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
@@ -23,6 +26,53 @@ impl PermissionMode {
             Self::DangerFullAccess => "danger-full-access",
             Self::Prompt => "prompt",
             Self::Allow => "allow",
+        }
+    }
+
+    /// Position on the privilege ladder used by [`PermissionPolicy`].
+    ///
+    /// This is the only ranking, and `Ord` is intentionally not derived, so a
+    /// stray `active_mode >= required_mode` no longer compiles. Ranking through
+    /// declaration order meant a variant inserted in the middle of the enum
+    /// silently re-ranked the ladder, and the difference between "this tool may
+    /// run" and "this tool may run after a prompt" was therefore a property of
+    /// where an `enum` line happened to sit. Every variant is named here, so an
+    /// insertion is a build failure instead of a silent re-ranking; the two
+    /// comparisons outside this module that do read a rank — the
+    /// `PermissionEnforcer`'s `check_with_required_mode` and the `claw doctor`
+    /// permission check — now say so at the call site.
+    ///
+    /// `Prompt` and `Allow` are *modes of operation*, not privilege tiers. They
+    /// rank above every tier so those two callers keep the answers they had, but
+    /// they are never ranked *against* a tier: see [`Self::covers`].
+    #[must_use]
+    pub const fn privilege_rank(self) -> u8 {
+        match self {
+            Self::ReadOnly => 0,
+            Self::WorkspaceWrite => 1,
+            Self::DangerFullAccess => 2,
+            Self::Prompt => 3,
+            Self::Allow => 4,
+        }
+    }
+
+    /// Whether a session running in `self` may use a tool that requires
+    /// `required` without asking.
+    ///
+    /// Only tiers answer this by rank. `Allow` never asks and `Prompt` always
+    /// asks — it is the exact opposite of a silent allow — so neither is a
+    /// statement about how much of the workspace the session may touch, and
+    /// comparing either to `required` is comparing a mode to a tier. That
+    /// comparison is what let `Prompt`, which outranks `DangerFullAccess`, make
+    /// the ladder return `Allow` for every tool and skip the prompter entirely.
+    #[must_use]
+    pub const fn covers(self, required: Self) -> bool {
+        match self {
+            Self::Allow => true,
+            Self::Prompt => false,
+            Self::ReadOnly | Self::WorkspaceWrite | Self::DangerFullAccess => {
+                self.privilege_rank() >= required.privilege_rank()
+            }
         }
     }
 }
@@ -236,29 +286,12 @@ impl PermissionPolicy {
                     prompter,
                 );
             }
-            Some(PermissionOverride::Allow) => {
-                if let Some(rule) = ask_rule {
-                    let reason = format!(
-                        "tool '{tool_name}' requires approval due to ask rule '{}'",
-                        rule.raw
-                    );
-                    return Self::prompt_or_deny(
-                        tool_name,
-                        input,
-                        current_mode,
-                        required_mode,
-                        Some(reason),
-                        prompter,
-                    );
-                }
-                if allow_rule.is_some()
-                    || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
-                {
-                    return PermissionOutcome::Allow;
-                }
-            }
-            None => {}
+            // A hook `allow` is an override, not a bypass: the ask-rule check
+            // and the privilege ladder below still run for it. Both used to be
+            // spelled out a second time inside this arm, which is why the ladder
+            // existed in two copies that had to be corrected in step — and the
+            // second copy is exactly what a fix for one of them is easy to miss.
+            Some(PermissionOverride::Allow) | None => {}
         }
 
         if let Some(rule) = ask_rule {
@@ -276,10 +309,10 @@ impl PermissionPolicy {
             );
         }
 
-        if allow_rule.is_some()
-            || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
-        {
+        // The ladder, in one place. An `allow` rule is an explicit grant for
+        // this tool and outranks the mode; otherwise the mode decides through
+        // [`PermissionMode::covers`].
+        if allow_rule.is_some() || current_mode.covers(required_mode) {
             return PermissionOutcome::Allow;
         }
 
@@ -585,6 +618,132 @@ mod tests {
             policy.authorize("bash", "echo hi", Some(&mut prompter)),
             PermissionOutcome::Deny { reason } if reason == "not now"
         ));
+    }
+
+    #[test]
+    fn prompt_mode_routes_to_prompter_instead_of_auto_allowing() {
+        // Regression: `Prompt` sorts above `DangerFullAccess` in the
+        // `PermissionMode` `Ord` derivation, so the `current_mode >= required_mode`
+        // ladder check used to auto-allow every tool in `Prompt` mode and never
+        // invoke the prompter — defeating the entire purpose of the mode.
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+
+        let outcome = policy.authorize("read_file", "{}", Some(&mut prompter));
+
+        assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].tool_name, "read_file");
+        assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
+    }
+
+    #[test]
+    fn prompt_mode_denies_when_no_prompter_is_available() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+
+        assert!(matches!(
+            policy.authorize("read_file", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn prompt_mode_prompts_for_every_privilege_tier() {
+        // The ladder used to exist twice — once on the plain path and once inside
+        // the `Some(PermissionOverride::Allow)` arm — so a hook emitting
+        // `permissionDecision: "allow"` (see `hooks.rs`) had its own route to the
+        // auto-allow. Sweeping the tiers against both routes keeps them honest now
+        // that they are one predicate.
+        for required in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            for override_decision in [None, Some(PermissionOverride::Allow)] {
+                let policy = PermissionPolicy::new(PermissionMode::Prompt)
+                    .with_tool_requirement("read_file", required);
+                let context = PermissionContext::new(
+                    override_decision,
+                    override_decision.map(|_| "hook approved".to_string()),
+                );
+                let mut prompter = RecordingPrompter {
+                    seen: Vec::new(),
+                    allow: true,
+                };
+
+                let outcome =
+                    policy.authorize_with_context("read_file", "{}", &context, Some(&mut prompter));
+
+                assert_eq!(
+                    outcome,
+                    PermissionOutcome::Allow,
+                    "an approving prompter must still pass a {required:?} tool"
+                );
+                assert_eq!(
+                    prompter.seen.len(),
+                    1,
+                    "prompt mode skipped the prompter for a {required:?} tool \
+                     (override = {override_decision:?})"
+                );
+                assert_eq!(prompter.seen[0].tool_name, "read_file");
+                assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
+                assert_eq!(prompter.seen[0].required_mode, required);
+            }
+        }
+    }
+
+    #[test]
+    fn privilege_rank_orders_the_privilege_tiers() {
+        assert!(
+            PermissionMode::ReadOnly.privilege_rank()
+                < PermissionMode::WorkspaceWrite.privilege_rank()
+        );
+        assert!(
+            PermissionMode::WorkspaceWrite.privilege_rank()
+                < PermissionMode::DangerFullAccess.privilege_rank()
+        );
+    }
+
+    #[test]
+    fn privilege_rank_places_the_operating_modes_above_every_tier() {
+        // `Prompt` and `Allow` are modes of operation rather than tiers, so
+        // `covers` answers for them by name and never consults this number. They
+        // still have to rank above every tier, because two callers outside this
+        // module — the `PermissionEnforcer`'s `check_with_required_mode` and the
+        // `claw doctor` permission check — compare ranks, and a `Prompt`/`Allow`
+        // session must keep the result it had under the old derived `Ord`.
+        for mode in [PermissionMode::Prompt, PermissionMode::Allow] {
+            assert!(
+                mode.privilege_rank() > PermissionMode::DangerFullAccess.privilege_rank(),
+                "{mode:?} must outrank danger-full-access"
+            );
+            assert!(
+                mode.privilege_rank() > PermissionMode::WorkspaceWrite.privilege_rank(),
+                "{mode:?} must outrank workspace-write"
+            );
+        }
+    }
+
+    #[test]
+    fn covers_never_compares_an_operating_mode_against_a_tier() {
+        for required in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            assert!(
+                !PermissionMode::Prompt.covers(required),
+                "prompt mode must ask before running a {required:?} tool"
+            );
+        }
+        assert!(PermissionMode::Allow.covers(PermissionMode::DangerFullAccess));
+        assert!(PermissionMode::DangerFullAccess.covers(PermissionMode::WorkspaceWrite));
+        assert!(!PermissionMode::WorkspaceWrite.covers(PermissionMode::DangerFullAccess));
     }
 
     #[test]

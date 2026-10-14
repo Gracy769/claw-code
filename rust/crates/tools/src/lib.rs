@@ -20,7 +20,7 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
+    read_file_in_workspace_with_selector,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -28,7 +28,7 @@ use runtime::{
     write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MemoryStore, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
     Session, TaskPacket, ToolError, ToolExecutor,
 };
@@ -1168,6 +1168,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "MemoryRead",
+            description: "Read a file from the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to read memory entries or the MEMORY.md index.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'user_role.md')." }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "MemoryWrite",
+            description: "Write a file to the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to create or update memory entries and the MEMORY.md index. Parent directories are created automatically.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'feedback_style.md')." },
+                    "content": { "type": "string", "description": "Full file content to write." }
+                },
+                "required": ["file_path", "content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "LSP",
             description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
             input_schema: json!({
@@ -1479,6 +1506,8 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
+        "MemoryRead" => from_value::<MemoryReadInput>(input).and_then(run_memory_read),
+        "MemoryWrite" => from_value::<MemoryWriteInput>(input).and_then(run_memory_write),
         "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
@@ -1846,6 +1875,96 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
         "crons": entries,
         "count": entries.len()
     }))
+}
+
+const MEMORY_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_read(input: MemoryReadInput) -> Result<String, String> {
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    reject_symlink(&target)?;
+    let meta = std::fs::metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("memory file not found: {}", target.display())
+        } else {
+            format!("failed to read memory file: {e}")
+        }
+    })?;
+    if meta.len() > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "memory file too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            meta.len(),
+        ));
+    }
+    let content =
+        std::fs::read_to_string(&target).map_err(|e| format!("failed to read memory file: {e}"))?;
+    to_pretty_json(json!({
+        "file_path": target.display().to_string(),
+        "content": content
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_write(input: MemoryWriteInput) -> Result<String, String> {
+    if input.content.len() as u64 > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "content too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            input.content.len(),
+        ));
+    }
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    store
+        .ensure_dir()
+        .map_err(|e| format!("failed to create memory directory: {e}"))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create parent directory: {e}"))?;
+    }
+    if target.exists() {
+        reject_symlink(&target)?;
+    }
+    let kind = if target.exists() { "update" } else { "create" };
+    std::fs::write(&target, &input.content)
+        .map_err(|e| format!("failed to write memory file: {e}"))?;
+    to_pretty_json(json!({
+        "type": kind,
+        "file_path": target.display().to_string(),
+        "memory_dir": store.memory_dir().display().to_string()
+    }))
+}
+
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing to follow symlink: {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn memory_store_for_cwd() -> Result<MemoryStore, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    Ok(MemoryStore::for_workspace(&cwd))
+}
+
+fn resolve_memory_path(store: &MemoryStore, relative: &str) -> Result<PathBuf, String> {
+    let relative = relative.trim();
+    if relative.is_empty() {
+        return Err("file_path must not be empty".to_string());
+    }
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err("file_path must be relative to the memory directory, not absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("file_path must not contain '..' components".to_string());
+    }
+    Ok(store.memory_dir().join(path))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2450,8 +2569,14 @@ fn branch_divergence_output(
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
-            .map_err(io_to_string)?,
+        read_file_in_workspace_with_selector(
+            &input.path,
+            input.offset,
+            input.limit,
+            input.selector.as_deref(),
+            &workspace,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
@@ -2766,6 +2891,7 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3014,6 +3140,17 @@ struct CronCreateInput {
 #[derive(Debug, Deserialize)]
 struct CronDeleteInput {
     cron_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryReadInput {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryWriteInput {
+    file_path: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10555,6 +10692,43 @@ printf 'pwsh:%s' "$1"
         let registry = read_only_registry();
         let result = registry.execute("read_file", &json!({ "path": file.display().to_string() }));
         assert!(result.is_ok(), "read_file should be allowed: {result:?}");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn given_read_only_enforcer_when_read_file_with_selector_then_succeeds() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("perm-read-selector");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("multi-line.txt");
+        fs::write(&file, "line1\nline2\nline3\nline4\nline5\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = read_only_registry();
+        let result = registry.execute(
+            "read_file",
+            &json!({
+                "path": file.display().to_string(),
+                "selector": "2-4"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "read_file with selector should succeed: {result:?}"
+        );
+
+        // Verify the output contains the expected lines
+        let output: serde_json::Value =
+            serde_json::from_str(&result.unwrap()).expect("json output");
+        let content = output["file"]["content"].as_str().expect("content field");
+        assert!(content.contains("line2"));
+        assert!(content.contains("line3"));
+        assert!(content.contains("line4"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);

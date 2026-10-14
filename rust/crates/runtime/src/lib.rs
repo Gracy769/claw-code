@@ -20,6 +20,7 @@ pub mod green_contract;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod line_range_selector;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -27,6 +28,7 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod memory_store;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -39,6 +41,7 @@ mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod session_settings;
 pub mod trident;
 pub use session_control::SessionStore;
 mod sse;
@@ -81,12 +84,13 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ConversationEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+    ToolError, ToolExecutor, TurnControlSignal, TurnInterruptSignal, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
-    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
+    grep_search_in_workspace, read_file, read_file_in_workspace,
+    read_file_in_workspace_with_selector, read_file_with_selector, write_file,
     write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
     ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
@@ -123,6 +127,7 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
+pub use memory_store::{MemoryEntry, MemoryStore, MemoryType};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
@@ -174,6 +179,10 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+};
+pub use session_settings::{
+    ConfigHotreloadMonitor, SessionSettings, SettingApplicator, SettingCategory, SettingSchema,
+    SettingSchemaRegistry, SettingType,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

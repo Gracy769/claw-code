@@ -10,6 +10,8 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::line_range_selector::{self, LineRangeSelector};
+
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -88,6 +90,9 @@ pub struct ReadFileOutput {
     #[serde(rename = "type")]
     pub kind: String,
     pub file: TextFilePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "truncationFooter")]
+    pub truncation_footer: Option<String>,
 }
 
 /// Structured patch hunk emitted by write and edit operations.
@@ -202,6 +207,19 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
+    read_file_with_selector(path, offset, limit, None)
+}
+
+/// Reads a text file with optional GJC-style line range selector.
+///
+/// The selector takes precedence over offset/limit if provided.
+/// Selector syntax: `:50`, `:50-200`, `:50+150`, `:raw`, `:conflicts`, `:5-16,960-973`
+pub fn read_file_with_selector(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    selector: Option<&str>,
+) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
 
     // Check file size before reading
@@ -227,11 +245,56 @@ pub fn read_file(
 
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
-    let start_index = offset.unwrap_or(0).min(lines.len());
-    let end_index = limit.map_or(lines.len(), |limit| {
-        start_index.saturating_add(limit).min(lines.len())
-    });
-    let selected = lines[start_index..end_index].join("\n");
+    let total_lines = lines.len();
+
+    // Special handling for conflicts selector
+    if selector == Some("conflicts") {
+        let conflicts = extract_merge_conflicts(&lines);
+        let (selected, num_lines) = if conflicts.is_empty() {
+            (format!("No unresolved git merge conflicts in {}.", path), 1)
+        } else {
+            let display_path = absolute_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let summary = format_conflict_summary(&conflicts, display_path);
+            let summary_lines = summary.lines().count();
+            (summary, summary_lines)
+        };
+
+        return Ok(ReadFileOutput {
+            kind: String::from("text"),
+            file: TextFilePayload {
+                file_path: absolute_path.to_string_lossy().into_owned(),
+                content: selected,
+                num_lines,
+                start_line: 1,
+                total_lines,
+            },
+            truncation_footer: None,
+        });
+    }
+
+    // Determine which lines to select
+    let (start_index, end_index, truncation_footer) = if let Some(sel) = selector {
+        // Parse and apply selector
+        let parsed = line_range_selector::parse_selector(sel)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        apply_line_selector(&lines, parsed, path)
+    } else {
+        // Use offset/limit for backward compatibility
+        let start = offset.unwrap_or(0).min(lines.len());
+        let end = limit.map_or(lines.len(), |lim| {
+            start.saturating_add(lim).min(lines.len())
+        });
+        (start, end, None)
+    };
+
+    let selected = if start_index < end_index {
+        lines[start_index..end_index].join("\n")
+    } else {
+        String::new()
+    };
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
@@ -240,9 +303,253 @@ pub fn read_file(
             content: selected,
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
-            total_lines: lines.len(),
+            total_lines,
         },
+        truncation_footer,
     })
+}
+
+/// Represents a merge conflict block in a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictBlock {
+    start_line: usize,        // 1-based line number where <<<<<<< starts
+    separator_line: usize,    // 1-based line number where ======= is
+    end_line: usize,          // 1-based line number where >>>>>>> is
+    base_line: Option<usize>, // 1-based line number where ||||||| is (for 3-way)
+    ours_label: Option<String>,
+    base_label: Option<String>,
+    theirs_label: Option<String>,
+}
+
+/// Scans lines for unresolved git merge conflict blocks.
+fn extract_merge_conflicts(lines: &[&str]) -> Vec<ConflictBlock> {
+    let mut blocks = Vec::new();
+    let mut i = 0;
+
+    const OURS_PREFIX: &str = "<<<<<<<";
+    const BASE_PREFIX: &str = "|||||||";
+    const SEPARATOR: &str = "=======";
+    const THEIRS_PREFIX: &str = ">>>>>>>";
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Check for start of conflict block
+        if let Some(label) = extract_marker_label(line, OURS_PREFIX) {
+            let ours_label = if label.is_empty() {
+                None
+            } else {
+                Some(label.to_string())
+            };
+            let start_line = i + 1; // Convert to 1-based
+            let mut separator_line = None;
+            let mut base_line = None;
+            let mut base_label = None;
+            let mut end_line = None;
+            let mut theirs_label = None;
+            let mut j = i + 1;
+
+            // Look for separator, optional base marker, and end marker
+            while j < lines.len() {
+                let current = lines[j];
+
+                // Check for base marker (3-way)
+                if let Some(label) = extract_marker_label(current, BASE_PREFIX) {
+                    if base_line.is_none() {
+                        base_line = Some(j + 1);
+                        base_label = if label.is_empty() {
+                            None
+                        } else {
+                            Some(label.to_string())
+                        };
+                        j += 1;
+                        continue;
+                    }
+                }
+
+                // Check for separator
+                if current.trim() == SEPARATOR {
+                    if separator_line.is_none() {
+                        separator_line = Some(j + 1);
+                        j += 1;
+                        continue;
+                    }
+                }
+
+                // Check for end marker
+                if let Some(label) = extract_marker_label(current, THEIRS_PREFIX) {
+                    if separator_line.is_some() {
+                        end_line = Some(j + 1);
+                        theirs_label = if label.is_empty() {
+                            None
+                        } else {
+                            Some(label.to_string())
+                        };
+                        j += 1;
+                        break;
+                    }
+                }
+
+                j += 1;
+            }
+
+            // Only add if we found both separator and end marker
+            if let (Some(sep_line), Some(end)) = (separator_line, end_line) {
+                blocks.push(ConflictBlock {
+                    start_line,
+                    separator_line: sep_line,
+                    end_line: end,
+                    base_line,
+                    ours_label,
+                    base_label,
+                    theirs_label,
+                });
+                i = j;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    blocks
+}
+
+/// Extract the optional label from a marker line.
+/// Returns the label text (stripped of leading/trailing spaces) if the line matches the prefix,
+/// or None otherwise.
+fn extract_marker_label<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    if line.starts_with(prefix) {
+        let rest = &line[prefix.len()..];
+        // Accept either just the prefix or prefix + single space + label
+        if rest.is_empty() {
+            Some("")
+        } else if rest.starts_with(' ') {
+            Some(rest[1..].trim())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Format conflict blocks as a summary index, like GJC's implementation.
+fn format_conflict_summary(conflicts: &[ConflictBlock], display_path: &str) -> String {
+    let mut output = Vec::new();
+    let total = conflicts.len();
+    let word = if total == 1 { "conflict" } else { "conflicts" };
+
+    output.push(format!(
+        "⚠ {} unresolved {} in {}",
+        total, word, display_path
+    ));
+
+    // Extract labels for header
+    let ours_label = conflicts.iter().find_map(|c| c.ours_label.as_ref());
+    let theirs_label = conflicts.iter().find_map(|c| c.theirs_label.as_ref());
+    let base_label = conflicts.iter().find_map(|c| c.base_label.as_ref());
+    let any_base = conflicts.iter().any(|c| c.base_line.is_some());
+
+    if let Some(label) = ours_label {
+        output.push(format!("- ours = {}", label));
+    }
+    if let Some(label) = theirs_label {
+        output.push(format!("- theirs = {}", label));
+    }
+    if any_base {
+        let base_name = base_label
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "(no label)".to_string());
+        output.push(format!("- base = {}", base_name));
+    }
+
+    output.push(
+        "NOTICE: Bulk-resolve with `write({ path: \"conflict://*\", content })`, or address a single block with `write({ path: \"conflict://<N>\", content })`. Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` for a single side).".to_string()
+    );
+    output.push(
+        "`content` shorthand: `@ours` / `@theirs` / `@base` / `@both` lines expand to the recorded sections; `@both` = ours-then-theirs. Non-token lines pass through verbatim.".to_string()
+    );
+    output.push(String::new());
+
+    // Format each conflict as a one-liner index
+    let id_width = total.to_string().len();
+    for (idx, conflict) in conflicts.iter().enumerate() {
+        let id = idx + 1;
+        let range = if conflict.start_line == conflict.end_line {
+            format!("L{}", conflict.start_line)
+        } else {
+            format!("L{}-{}", conflict.start_line, conflict.end_line)
+        };
+        let kind = if conflict.base_line.is_some() {
+            "  (3-way)"
+        } else {
+            ""
+        };
+        output.push(format!(
+            "#{:>width$}  {}{}",
+            id,
+            range,
+            kind,
+            width = id_width
+        ));
+    }
+
+    output.join("\n")
+}
+
+/// Apply a parsed line selector to file lines and return the selected range.
+///
+/// Returns (start_index, end_index, truncation_footer).
+fn apply_line_selector(
+    lines: &[&str],
+    selector: LineRangeSelector,
+    _file_path: &str,
+) -> (usize, usize, Option<String>) {
+    match selector {
+        LineRangeSelector::Raw => {
+            // Return entire file without truncation footer for raw mode
+            (0, lines.len(), None)
+        }
+        LineRangeSelector::Conflicts => {
+            // Conflicts are handled specially in read_file_with_selector, so this shouldn't be reached
+            (0, lines.len(), None)
+        }
+        LineRangeSelector::Lines(ranges) => {
+            // Collect all lines specified by ranges
+            let mut selected_indices = std::collections::BTreeSet::new();
+            for range in ranges {
+                let (start_zero, end_zero) = range.zero_indexed();
+                for i in start_zero..=end_zero.min(lines.len().saturating_sub(1)) {
+                    selected_indices.insert(i);
+                }
+            }
+
+            if selected_indices.is_empty() {
+                return (0, 0, None);
+            }
+
+            // Find contiguous blocks and return the first one (or could merge all)
+            let indices: Vec<usize> = selected_indices.iter().copied().collect();
+            let first = indices[0];
+            let last = indices[indices.len() - 1];
+
+            // Check if it's a contiguous range
+            let is_contiguous = (last - first + 1) == indices.len();
+
+            if is_contiguous {
+                (first, last + 1, None)
+            } else {
+                // Return all selected indices as one continuous block from first to last
+                // In the future, this could be improved to show multiple blocks
+                (first, last + 1, None)
+            }
+        }
+        LineRangeSelector::None => {
+            // No selector, return entire file
+            (0, lines.len(), None)
+        }
+    }
 }
 
 /// Replaces a file's contents and returns patch metadata.
@@ -716,10 +1023,22 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
+    read_file_in_workspace_with_selector(path, offset, limit, None, workspace_root)
+}
+
+/// Read a file with workspace boundary enforcement and optional line range selector.
+#[allow(dead_code)]
+pub fn read_file_in_workspace_with_selector(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    selector: Option<&str>,
+    workspace_root: &Path,
+) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
     let canonical_root = canonicalize_workspace_root(workspace_root);
     validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    read_file_with_selector(path, offset, limit, selector)
 }
 
 /// Write a file with workspace boundary enforcement.
@@ -1182,5 +1501,190 @@ mod tests {
         assert!(component_contains_glob("**"));
         assert!(component_contains_glob("*.rs"));
         assert!(!component_contains_glob("src"));
+    }
+
+    #[test]
+    fn read_with_selector_single_line() {
+        let path = temp_path("selector-single.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let output =
+            super::read_file_with_selector(path.to_string_lossy().as_ref(), None, None, Some("2"))
+                .expect("read with selector should succeed");
+        assert_eq!(output.file.content, "line2");
+        assert_eq!(output.file.start_line, 2);
+        assert_eq!(output.file.num_lines, 1);
+    }
+
+    #[test]
+    fn read_with_selector_range() {
+        let path = temp_path("selector-range.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("2-4"),
+        )
+        .expect("read with selector should succeed");
+        assert_eq!(output.file.content, "line2\nline3\nline4");
+        assert_eq!(output.file.start_line, 2);
+        assert_eq!(output.file.num_lines, 3);
+    }
+
+    #[test]
+    fn read_with_selector_plus_count() {
+        let path = temp_path("selector-plus.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("2+2"),
+        )
+        .expect("read with selector should succeed");
+        assert_eq!(output.file.content, "line2\nline3");
+        assert_eq!(output.file.start_line, 2);
+        assert_eq!(output.file.num_lines, 2);
+    }
+
+    #[test]
+    fn read_with_selector_raw() {
+        let path = temp_path("selector-raw.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("raw"),
+        )
+        .expect("read with selector should succeed");
+        assert_eq!(output.file.content, "line1\nline2\nline3\nline4\nline5");
+        assert_eq!(output.file.start_line, 1);
+        assert_eq!(output.file.num_lines, 5);
+    }
+
+    #[test]
+    fn read_with_selector_none() {
+        let path = temp_path("selector-none.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let output =
+            super::read_file_with_selector(path.to_string_lossy().as_ref(), None, None, None)
+                .expect("read with selector should succeed");
+        assert_eq!(output.file.content, "line1\nline2\nline3\nline4\nline5");
+        assert_eq!(output.file.start_line, 1);
+        assert_eq!(output.file.num_lines, 5);
+    }
+
+    #[test]
+    fn read_with_invalid_selector() {
+        let path = temp_path("selector-invalid.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "line1\nline2\nline3\nline4\nline5",
+        )
+        .expect("write should succeed");
+
+        let result = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("invalid-selector"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_with_selector_conflicts_no_conflicts() {
+        let path = temp_path("conflicts-none.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "const a = 1;\nconst b = 2;\n",
+        )
+        .expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("conflicts"),
+        )
+        .expect("read with conflicts selector should succeed");
+        assert!(output
+            .file
+            .content
+            .contains("No unresolved git merge conflicts"));
+    }
+
+    #[test]
+    fn read_with_selector_conflicts_two_way() {
+        let path = temp_path("conflicts-two-way.txt");
+        let content = "<<<<<<< A\na-ours\n=======\na-theirs\n>>>>>>> A\nmiddle\n<<<<<<< B\nb-ours\n=======\nb-theirs\n>>>>>>> B\ntail";
+        write_file(path.to_string_lossy().as_ref(), content).expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("conflicts"),
+        )
+        .expect("read with conflicts selector should succeed");
+
+        let text = &output.file.content;
+        // Should report 2 conflicts
+        assert!(text.contains("2 unresolved conflicts"), "text: {}", text);
+        // Should have indices for both blocks
+        assert!(text.contains("#1"), "missing #1: {}", text);
+        assert!(text.contains("#2"), "missing #2: {}", text);
+        // Should have line ranges
+        assert!(text.contains("L1-5"), "missing L1-5: {}", text);
+        assert!(text.contains("L7-11"), "missing L7-11: {}", text);
+    }
+
+    #[test]
+    fn read_with_selector_conflicts_three_way() {
+        let path = temp_path("conflicts-three-way.txt");
+        let content = "head\n<<<<<<< HEAD\nours body\n||||||| common ancestor\nbase body\n=======\ntheirs body\n>>>>>>> feat\ntail";
+        write_file(path.to_string_lossy().as_ref(), content).expect("write should succeed");
+
+        let output = super::read_file_with_selector(
+            path.to_string_lossy().as_ref(),
+            None,
+            None,
+            Some("conflicts"),
+        )
+        .expect("read with conflicts selector should succeed");
+
+        let text = &output.file.content;
+        // Should report 1 conflict
+        assert!(text.contains("1 unresolved conflict"), "text: {}", text);
+        // Should mark as 3-way
+        assert!(text.contains("3-way"), "missing 3-way marker: {}", text);
+        // Should show line range
+        assert!(text.contains("L2-8"), "missing L2-8: {}", text);
     }
 }

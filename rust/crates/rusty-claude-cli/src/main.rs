@@ -16,6 +16,7 @@
 )]
 mod init;
 mod input;
+mod interrupt;
 mod render;
 mod setup_wizard;
 
@@ -27,6 +28,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -59,9 +61,10 @@ use runtime::{
     resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
     CompactionConfig, ConfigFileReport, ConfigLoader, ConfigSource, ContentBlock, ContextFile,
     ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
-    McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    McpServer, McpServerManager, McpServerSpec, McpTool, MemoryStore, MessageRole, ModelPricing,
+    PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
+    RuntimeError, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -1033,6 +1036,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_system_prompt(cwd, date, &model, output_format)?,
         CliAction::Version { output_format } => print_version(output_format)?,
+        CliAction::Tools { output_format } => print_tools(output_format)?,
+        CliAction::Info { output_format } => print_info(output_format)?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -1192,6 +1197,12 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Version {
+        output_format: CliOutputFormat,
+    },
+    Tools {
+        output_format: CliOutputFormat,
+    },
+    Info {
         output_format: CliOutputFormat,
     },
     SessionList {
@@ -2596,6 +2607,8 @@ fn parse_direct_slash_cli_action(
         Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
         Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
+        Ok(Some(SlashCommand::Tools)) => Ok(CliAction::Tools { output_format }),
+        Ok(Some(SlashCommand::Info)) => Ok(CliAction::Info { output_format }),
         Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor {
             output_format,
             permission_mode,
@@ -2986,7 +2999,18 @@ fn is_local_openai_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
         return !rest.is_empty() && rest.split('/').all(|segment| !segment.is_empty());
     }
-    std::env::var_os("OPENAI_BASE_URL").is_some() && (model.contains(':') || model.contains('.'))
+    let Ok(base_url) = std::env::var("OPENAI_BASE_URL") else {
+        return false;
+    };
+    // A local/private OPENAI_BASE_URL (Ollama, LM Studio, llama.cpp, vLLM, ...)
+    // is trusted to accept any non-empty model name the server actually
+    // serves, matching the OLLAMA_HOST bypass above. Remote gateways keep the
+    // stricter dot/colon-tag heuristic so a bare typo doesn't silently route
+    // to a paid hosted API.
+    if api::is_local_openai_compatible_base_url(&base_url) {
+        return !model.is_empty();
+    }
+    model.contains(':') || model.contains('.')
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
@@ -3718,6 +3742,7 @@ fn render_doctor_report(
             check_install_source_health(),
             check_workspace_health(&context),
             check_memory_health(&context),
+            check_auto_memory_health(&context.cwd),
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
@@ -4222,15 +4247,18 @@ fn check_permission_health(permission_mode: PermissionModeProvenance) -> Diagnos
         || source.to_string(),
         |env_var| format!("{source}:{env_var}"),
     );
+    // Ranks, not declaration order: `PermissionMode` deliberately does not
+    // derive `Ord`, so the ladder is named at every comparison site.
     let specs = mvp_tool_specs();
+    let active_rank = permission_mode.mode.privilege_rank();
     let tools_satisfied = specs
         .iter()
-        .filter(|spec| permission_mode.mode >= spec.required_permission)
+        .filter(|spec| active_rank >= spec.required_permission.privilege_rank())
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
     let tools_gated = specs
         .iter()
-        .filter(|spec| permission_mode.mode < spec.required_permission)
+        .filter(|spec| active_rank < spec.required_permission.privilege_rank())
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
 
@@ -4470,6 +4498,50 @@ fn check_memory_health(context: &StatusContext) -> DiagnosticCheck {
             json!(context.unloaded_memory_files),
         ),
     ]))
+}
+
+fn check_auto_memory_health(cwd: &Path) -> DiagnosticCheck {
+    let store = MemoryStore::for_workspace(cwd);
+    let entry_count = store.entry_count();
+    let has_index = store.index_content().is_some();
+    let mut details = vec![
+        format!("Directory       {}", store.memory_dir().display()),
+        format!("Exists          {}", store.exists()),
+        format!("Entries         {entry_count}"),
+        format!(
+            "MEMORY.md       {}",
+            if has_index { "present" } else { "absent" }
+        ),
+    ];
+
+    let level = if store.exists() && entry_count > 0 && !has_index {
+        details.push("MEMORY.md index is missing but memory entries exist".to_string());
+        DiagnosticLevel::Warn
+    } else {
+        DiagnosticLevel::Ok
+    };
+
+    let summary = if !store.exists() {
+        "auto memory not yet initialized".to_string()
+    } else if entry_count == 0 {
+        "auto memory directory exists, no entries yet".to_string()
+    } else {
+        format!("{entry_count} auto memory entries stored")
+    };
+
+    DiagnosticCheck::new("Auto-Memory", level, summary)
+        .with_hint(if level == DiagnosticLevel::Warn {
+            "Create a MEMORY.md index file in the memory directory to enable context loading at session start."
+        } else {
+            ""
+        })
+        .with_details(details)
+        .with_data(Map::from_iter([
+            ("directory".to_string(), json!(store.memory_dir().display().to_string())),
+            ("exists".to_string(), json!(store.exists())),
+            ("entry_count".to_string(), json!(entry_count)),
+            ("has_index".to_string(), json!(has_index)),
+        ]))
 }
 
 fn check_boot_preflight_health(context: &StatusContext) -> DiagnosticCheck {
@@ -5014,6 +5086,84 @@ fn version_json_value() -> serde_json::Value {
         "executable_path": binary_provenance.executable_path,
         "binary_provenance": binary_provenance.json_value(),
     })
+}
+
+fn print_tools(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let specs = mvp_tool_specs();
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Available tools ({}):", specs.len());
+            for spec in &specs {
+                println!("  {}\n    {}", spec.name, spec.description);
+            }
+        }
+        CliOutputFormat::Json => {
+            let tools: Vec<_> = specs
+                .into_iter()
+                .map(|spec| {
+                    json!({
+                        "name": spec.name,
+                        "description": spec.description,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "tools",
+                    "action": "list",
+                    "status": "ok",
+                    "tools": tools,
+                    "count": tools.len(),
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_info(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir().ok();
+    let binary_provenance = binary_provenance_for(cwd.as_deref());
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("claw-code runtime information:");
+            println!("  Version: {}", VERSION);
+            if let Some(sha) = &binary_provenance.git_sha_short {
+                println!("  Git SHA: {}", sha);
+            }
+            if let Some(branch) = &binary_provenance.branch {
+                println!("  Branch: {}", branch);
+            }
+            println!("  Commit date: {}", binary_provenance.commit_date);
+            println!("  Rustc version: {}", binary_provenance.rustc_version);
+            if let Some(target) = &binary_provenance.target {
+                println!("  Target: {}", target);
+            }
+            if let Some(path) = binary_provenance.executable_path {
+                println!("  Executable: {}", path);
+            }
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "info",
+                    "action": "show",
+                    "status": "ok",
+                    "version": VERSION,
+                    "git_sha": binary_provenance.git_sha,
+                    "git_sha_short": binary_provenance.git_sha_short,
+                    "branch": binary_provenance.branch,
+                    "commit_date": binary_provenance.commit_date,
+                    "rustc_version": binary_provenance.rustc_version,
+                    "target": binary_provenance.target,
+                    "executable_path": binary_provenance.executable_path,
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6654,6 +6804,49 @@ fn run_resume_command(
             message: Some(render_memory_report()?),
             json: Some(render_memory_json()?),
         }),
+        SlashCommand::Workspace { path } => {
+            let cwd_before = env::current_dir()?;
+            let workspace_root = session
+                .workspace_root()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| cwd_before.clone());
+            let workspace_root = canonicalize_or_clone(&workspace_root);
+            let changed = if let Some(path) = path.as_deref() {
+                let requested_path = Path::new(path);
+                let resolved_path = if requested_path.is_absolute() {
+                    requested_path.to_path_buf()
+                } else {
+                    cwd_before.join(requested_path)
+                };
+                let resolved_path = canonicalize_or_clone(&resolved_path);
+                if !resolved_path.starts_with(&workspace_root) {
+                    return Err(format!(
+                        "workspace_change_outside_root: `{}` is outside the current workspace root `{}`.\nUse `claw --cwd {}` to start a new session there.",
+                        resolved_path.display(),
+                        workspace_root.display(),
+                        resolved_path.display(),
+                    )
+                    .into());
+                }
+                env::set_current_dir(&resolved_path)?;
+                true
+            } else {
+                false
+            };
+            let cwd_after = env::current_dir()?;
+            let message =
+                render_workspace_report(&cwd_after, &workspace_root, &session.session_id, changed);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(workspace_report_json(
+                    &cwd_after,
+                    &workspace_root,
+                    &session.session_id,
+                    changed,
+                )),
+            })
+        }
         SlashCommand::Init => {
             // #142: run the init once, then render both text + structured JSON
             // from the same InitReport so both surfaces stay in sync.
@@ -6681,6 +6874,56 @@ fn run_resume_command(
             message: Some(render_version_report()),
             json: Some(version_json_value()),
         }),
+        SlashCommand::Tools => {
+            let specs = mvp_tool_specs();
+            let tool_count = specs.len();
+            let tools_text = specs
+                .iter()
+                .map(|spec| format!("  {}\n    {}", spec.name, spec.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let message = format!("Available tools ({}):\n{}", tool_count, tools_text);
+            let json_tools: Vec<_> = specs
+                .into_iter()
+                .map(|spec| serde_json::json!({ "name": spec.name, "description": spec.description }))
+                .collect();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(serde_json::json!({
+                    "kind": "tools",
+                    "action": "list",
+                    "status": "ok",
+                    "tools": json_tools,
+                    "count": tool_count,
+                })),
+            })
+        }
+        SlashCommand::Info => {
+            let cwd = env::current_dir().ok();
+            let binary_provenance = binary_provenance_for(cwd.as_deref());
+            let message = format!(
+                "claw-code runtime information:\n  Version: {}\n  Git SHA: {}\n  Rustc: {}\n  Target: {}",
+                VERSION,
+                binary_provenance.git_sha_short.as_deref().unwrap_or("unknown"),
+                binary_provenance.rustc_version,
+                binary_provenance.target.as_deref().unwrap_or("unknown")
+            );
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(serde_json::json!({
+                    "kind": "info",
+                    "action": "show",
+                    "status": "ok",
+                    "version": VERSION,
+                    "git_sha": binary_provenance.git_sha,
+                    "git_sha_short": binary_provenance.git_sha_short,
+                    "rustc_version": binary_provenance.rustc_version,
+                    "target": binary_provenance.target,
+                })),
+            })
+        }
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
@@ -7194,6 +7437,18 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_turn_interrupt_signal(mut self, signal: runtime::TurnInterruptSignal) -> Self {
+        let mut runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing turn interrupt signal");
+        runtime
+            .api_client_mut()
+            .set_turn_interrupt_signal(signal.clone());
+        self.runtime = Some(runtime.with_turn_interrupt_signal(signal));
+        self
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -7576,7 +7831,10 @@ struct HookAbortMonitor {
 }
 
 impl HookAbortMonitor {
-    fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+    fn spawn(
+        abort_signal: runtime::HookAbortSignal,
+        turn_interrupt_signal: runtime::TurnInterruptSignal,
+    ) -> Self {
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -7593,7 +7851,11 @@ impl HookAbortMonitor {
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => {
                         if result.is_ok() {
+                            // Ctrl+C stops the whole turn, not just running
+                            // hooks: the conversation loop and the streaming
+                            // client both poll the turn interrupt signal.
                             abort_signal.abort();
+                            turn_interrupt_signal.interrupt();
                         }
                     }
                     _ = wait_for_stop => {}
@@ -7642,6 +7904,7 @@ impl LiveCli {
             system_prompt.clone(),
             enable_tools,
             true,
+            TerminalTail::new(),
             allowed_tools.clone(),
             permission_mode,
             None,
@@ -7698,7 +7961,7 @@ impl LiveCli {
   \x1b[2mDirectory\x1b[0m        {}\n\
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline · \x1b[2mEsc\x1b[0m interrupts a running turn",
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -7723,8 +7986,13 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+        terminal_tail: TerminalTail,
+    ) -> Result<
+        (BuiltRuntime, HookAbortMonitor, runtime::TurnInterruptSignal),
+        Box<dyn std::error::Error>,
+    > {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let turn_interrupt_signal = runtime::TurnInterruptSignal::new();
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -7732,14 +8000,17 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             emit_output,
+            terminal_tail,
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
         )?
-        .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        .with_hook_abort_signal(hook_abort_signal.clone())
+        .with_turn_interrupt_signal(turn_interrupt_signal.clone());
+        let hook_abort_monitor =
+            HookAbortMonitor::spawn(hook_abort_signal, turn_interrupt_signal.clone());
 
-        Ok((runtime, hook_abort_monitor))
+        Ok((runtime, hook_abort_monitor, turn_interrupt_signal))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -7749,31 +8020,61 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let terminal_tail = TerminalTail::new();
+        let (mut runtime, hook_abort_monitor, turn_interrupt_signal) =
+            self.prepare_turn_runtime(true, terminal_tail.clone())?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut escape_monitor = None;
+        if let Some((monitor, stdin_gate)) =
+            interrupt::EscapeInterruptMonitor::spawn(turn_interrupt_signal)
+        {
+            permission_prompter = permission_prompter.with_stdin_gate(stdin_gate);
+            escape_monitor = Some(monitor);
+        }
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        // The animated frame is cursor control: it saves the cursor, rewrites the
+        // current line, and restores the cursor. None of that describes anything
+        // when stdout is a pipe — the escapes survive as literal bytes and the
+        // banner ends up glued to whatever the emitter writes next. Only animate
+        // on a terminal; the one-shot completion line below is plain text and is
+        // emitted either way.
+        if io::stdout().is_terminal() {
+            spinner.tick(
+                if escape_monitor.is_some() {
+                    "🦀 Thinking... (esc to interrupt)"
+                } else {
+                    "🦀 Thinking..."
+                },
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?
+        }
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        if let Some(monitor) = escape_monitor {
+            monitor.stop();
+        }
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                // The assistant response was already streamed to the terminal live
-                // during the turn (emit_output = true), so reprinting the full text
-                // here would duplicate the entire message. When text was streamed,
-                // emit a newline first so `spinner.finish`'s line-clear lands on a
-                // fresh line instead of erasing the last streamed line.
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
+                // The emitter owns the terminal during a turn: `emit_output = true`
+                // streams text deltas and echoes tool results live, so the response
+                // must not be printed again here — that was the duplicate output
+                // this PR's predecessor fixed.
+                //
+                // What the emitter may have left behind is a partial line, so ask it
+                // rather than guessing from `final_assistant_text(&summary)`: that
+                // guess is empty for tool-only turns, which still render.
+                if !terminal_tail.at_line_start() {
                     println!();
                 }
                 spinner.finish(
-                    "✨ Done",
+                    if summary.interrupted {
+                        "⏹ Interrupted"
+                    } else {
+                        "✨ Done"
+                    },
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -7789,6 +8090,13 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                // Same ownership rule as the success arm: `fail` clears the current
+                // line, so it may only do so when the emitter stopped on a line
+                // boundary. A turn that streamed text and then failed would
+                // otherwise lose its last partial line to the clear.
+                if !terminal_tail.at_line_start() {
+                    println!();
+                }
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
@@ -7900,15 +8208,15 @@ impl LiveCli {
                         *self.runtime.session_mut() = result.compacted_session.clone();
 
                         // Build a new runtime with the compacted session and retry
-                        let (mut new_runtime, hook_abort_monitor) =
-                            self.prepare_turn_runtime(true)?;
+                        let (mut new_runtime, hook_abort_monitor, _turn_interrupt_signal) =
+                            self.prepare_turn_runtime(true, terminal_tail.clone())?;
                         drop(hook_abort_monitor);
 
                         let mut rp = CliPermissionPrompter::new(self.permission_mode);
                         match new_runtime.run_turn(input, Some(&mut rp)) {
                             Ok(summary) => {
                                 self.replace_runtime(new_runtime)?;
-                                if !final_assistant_text(&summary).is_empty() {
+                                if !terminal_tail.at_line_start() {
                                     println!();
                                 }
                                 spinner.finish(
@@ -7993,7 +8301,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8006,7 +8315,8 @@ impl LiveCli {
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8031,7 +8341,8 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _turn_interrupt_signal) =
+            self.prepare_turn_runtime(false, TerminalTail::new())?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8130,6 +8441,7 @@ impl LiveCli {
                 Self::print_config(section.as_deref())?;
                 false
             }
+            SlashCommand::Workspace { path } => self.handle_workspace_command(path.as_deref())?,
             SlashCommand::Mcp { action, target } => {
                 let args = match (action.as_deref(), target.as_deref()) {
                     (None, None) => None,
@@ -8154,6 +8466,18 @@ impl LiveCli {
             }
             SlashCommand::Version => {
                 Self::print_version(CliOutputFormat::Text);
+                false
+            }
+            SlashCommand::Tools => {
+                if let Err(error) = print_tools(CliOutputFormat::Text) {
+                    eprintln!("Tools: {error}");
+                }
+                false
+            }
+            SlashCommand::Info => {
+                if let Err(error) = print_info(CliOutputFormat::Text) {
+                    eprintln!("Info: {error}");
+                }
                 false
             }
             SlashCommand::Export { path } => {
@@ -8288,6 +8612,51 @@ impl LiveCli {
         );
     }
 
+    fn handle_workspace_command(
+        &mut self,
+        target: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let current_dir = env::current_dir()?;
+        let workspace_root = self
+            .runtime
+            .session()
+            .workspace_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| current_dir.clone());
+        let workspace_root = canonicalize_or_clone(&workspace_root);
+
+        if let Some(target) = target {
+            let requested_path = Path::new(target);
+            let resolved_path = if requested_path.is_absolute() {
+                requested_path.to_path_buf()
+            } else {
+                current_dir.join(requested_path)
+            };
+            let resolved_path = canonicalize_or_clone(&resolved_path);
+            if !resolved_path.starts_with(&workspace_root) {
+                return Err(format!(
+                    "workspace_change_outside_root: `{}` is outside the current workspace root `{}`.\nUse `claw --cwd {}` to start a new session there.",
+                    resolved_path.display(),
+                    workspace_root.display(),
+                    resolved_path.display(),
+                )
+                .into());
+            }
+            env::set_current_dir(&resolved_path)?;
+        }
+
+        println!(
+            "{}",
+            render_workspace_report(
+                &env::current_dir()?,
+                &workspace_root,
+                &self.session.id,
+                target.is_some(),
+            )
+        );
+        Ok(target.is_some())
+    }
+
     fn record_prompt_history(&mut self, prompt: &str) {
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8387,6 +8756,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8433,6 +8803,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8463,6 +8834,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8505,6 +8877,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -8858,6 +9231,7 @@ impl LiveCli {
                     self.system_prompt.clone(),
                     true,
                     true,
+                    TerminalTail::new(),
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
@@ -8893,6 +9267,7 @@ impl LiveCli {
                     self.system_prompt.clone(),
                     true,
                     true,
+                    TerminalTail::new(),
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
@@ -8987,6 +9362,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -9007,6 +9383,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             true,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
@@ -9031,6 +9408,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             enable_tools,
             false,
+            TerminalTail::new(),
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
@@ -9117,6 +9495,41 @@ fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(Session::new().with_workspace_root(env::current_dir()?))
+}
+
+fn canonicalize_or_clone(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn render_workspace_report(
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    changed: bool,
+) -> String {
+    let action = if changed { "change" } else { "show" };
+    format!(
+        "Workspace\n  Action           {action}\n  Session          {session_id}\n  Workspace root   {}\n  Current directory {}",
+        workspace_root.display(),
+        cwd.display(),
+    )
+}
+
+fn workspace_report_json(
+    cwd: &Path,
+    workspace_root: &Path,
+    session_id: &str,
+    changed: bool,
+) -> Value {
+    serde_json::json!({
+        "kind": "workspace",
+        "action": if changed { "change" } else { "show" },
+        "status": "ok",
+        "session_id": session_id,
+        "workspace_root": workspace_root.display().to_string(),
+        "current_directory": cwd.display().to_string(),
+        "changed": changed,
+    })
 }
 
 fn create_managed_session_handle(
@@ -9503,6 +9916,7 @@ fn render_repl_help() -> String {
         "  Ctrl-R               Reverse-search prompt history".to_string(),
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
+        "  Esc                  Interrupt the running turn".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<workspace-fingerprint>/<session-id>.jsonl"
             .to_string(),
@@ -10436,7 +10850,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
+        "check_names": ["auth", "base urls", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "auto-memory", "boot preflight", "sandbox", "permissions", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -10997,6 +11411,44 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             ));
         }
     }
+
+    // Auto memory store
+    let store = MemoryStore::for_workspace(&cwd);
+    lines.push(String::new());
+    lines.push(format!(
+        "Auto memory
+  Directory  {}
+  Entries    {}",
+        store.memory_dir().display(),
+        store.entry_count()
+    ));
+    if store.exists() {
+        let entries = store.list_entries();
+        if entries.is_empty() {
+            lines.push("  (no memory files yet)".to_string());
+        } else {
+            for entry in &entries {
+                lines.push(format!(
+                    "  - {} (type={}, {})",
+                    entry.name,
+                    entry.memory_type.as_str(),
+                    entry.path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        match store.index_content() {
+            Some(index) => {
+                let line_count = index.lines().count();
+                lines.push(format!("  MEMORY.md index: {line_count} lines"));
+            }
+            None => {
+                lines.push("  MEMORY.md index: not yet created".to_string());
+            }
+        }
+    } else {
+        lines.push("  (directory not yet created)".to_string());
+    }
+
     Ok(lines.join(
         "
 ",
@@ -11017,6 +11469,23 @@ fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>>
             })
         })
         .collect();
+    let store = MemoryStore::for_workspace(&cwd);
+    let auto_memory_entries: Vec<_> = if store.exists() {
+        store
+            .list_entries()
+            .iter()
+            .map(|e| {
+                json!({
+                    "name": e.name,
+                    "type": e.memory_type.as_str(),
+                    "description": e.description,
+                    "path": e.path.display().to_string(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "kind": "memory",
         "action": "list",
@@ -11024,6 +11493,13 @@ fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>>
         "cwd": cwd.display().to_string(),
         "instruction_files": files.len(),
         "files": files,
+        "auto_memory": {
+            "directory": store.memory_dir().display().to_string(),
+            "exists": store.exists(),
+            "entry_count": store.entry_count(),
+            "entries": auto_memory_entries,
+            "has_index": store.index_content().is_some(),
+        }
     }))
 }
 
@@ -12378,6 +12854,7 @@ fn build_runtime(
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12390,6 +12867,7 @@ fn build_runtime(
         system_prompt,
         enable_tools,
         emit_output,
+        terminal_tail,
         allowed_tools,
         permission_mode,
         progress_reporter,
@@ -12406,6 +12884,7 @@ fn build_runtime_with_plugin_state(
     system_prompt: Vec<String>,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
@@ -12424,6 +12903,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let provider_config = provider_config_from_runtime(feature_config.provider())?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -12431,13 +12911,16 @@ fn build_runtime_with_plugin_state(
             model,
             enable_tools,
             emit_output,
+            terminal_tail.clone(),
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            provider_config,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
+            terminal_tail,
             tool_registry.clone(),
             mcp_state.clone(),
         ),
@@ -12486,11 +12969,20 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    stdin_gate: Option<interrupt::StdinPromptGate>,
 }
 
 impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            stdin_gate: None,
+        }
+    }
+
+    fn with_stdin_gate(mut self, stdin_gate: interrupt::StdinPromptGate) -> Self {
+        self.stdin_gate = Some(stdin_gate);
+        self
     }
 }
 
@@ -12499,6 +12991,12 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Take stdin back from the Esc listener (restoring canonical
+        // mode) for the duration of this line-based prompt.
+        let _stdin_lease = self
+            .stdin_gate
+            .as_ref()
+            .map(interrupt::StdinPromptGate::lease);
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -12533,12 +13031,159 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+/// Tracks whether the shared terminal stream currently sits at the start of a
+/// fresh line.
+///
+/// A turn's streamed assistant text has no trailing newline, and
+/// `Spinner::finish` moves to column 0 and clears the current line — so without
+/// a guard it erases the last thing the emitter rendered. Both writers that
+/// render live during a turn (the assistant/reasoning deltas in
+/// `AnthropicRuntimeClient::consume_stream` and the tool-result blocks in
+/// `CliToolExecutor::execute`) push their bytes
+/// through a `TailTrackingWriter` sharing one of these, which lets the caller
+/// that ends the turn ask the emitter what it actually left on the terminal.
+///
+/// The previous approach inferred this from `final_assistant_text(&summary)`,
+/// which agrees today only because every *other* writer terminates its output
+/// with a newline — tool results go through `stream_markdown` (which appends
+/// one), thinking summaries are written with a trailing newline, and tool-call
+/// headers use `writeln!`. That is a property of the current renderers rather
+/// than of the streaming protocol, and the text path already violates it, so
+/// recording the fact is cheaper than depending on it. The heuristic also left
+/// the failure arm unguarded: a turn that streamed text and then errored still
+/// had that line cleared.
+#[derive(Clone, Default)]
+struct TerminalTail {
+    at_line_start: Arc<AtomicBool>,
+}
+
+impl TerminalTail {
+    fn new() -> Self {
+        Self {
+            at_line_start: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// True when nothing has been written since the last newline, so clearing
+    /// the current terminal line cannot destroy rendered output.
+    fn at_line_start(&self) -> bool {
+        self.at_line_start.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, written: &[u8]) {
+        if let Some(last) = written.last() {
+            self.at_line_start.store(*last == b'\n', Ordering::Relaxed);
+        }
+    }
+}
+
+/// Forwards writes to `inner` while reporting the tail byte to a `TerminalTail`.
+struct TailTrackingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    tail: TerminalTail,
+}
+
+impl<'a, W: Write> TailTrackingWriter<'a, W> {
+    fn new(inner: &'a mut W, tail: TerminalTail) -> Self {
+        Self { inner, tail }
+    }
+}
+
+impl<W: Write> Write for TailTrackingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.tail.record(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
-// `detect_provider_kind(&model)`. The struct name is kept to avoid
-// churning `BuiltRuntime` and every Deref/DerefMut site that references
-// it. See ROADMAP #29 for the provider-dispatch routing fix.
+// OpenAI, or DashScope at construction time. Explicit persisted provider
+// configuration takes precedence; model-based provider detection remains
+// the fallback when no provider configuration is present. The struct name
+// is kept to avoid churning `BuiltRuntime` and every Deref/DerefMut site
+// that references it.
+
+fn provider_config_from_runtime(
+    provider: &runtime::RuntimeProviderConfig,
+) -> Result<Option<api::ProviderConfig>, Box<dyn std::error::Error>> {
+    let Some(kind) = provider.kind() else {
+        return Ok(None);
+    };
+
+    let kind = match kind.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => api::ProviderConfigKind::Anthropic,
+        "xai" => api::ProviderConfigKind::Xai,
+        "openai" => api::ProviderConfigKind::OpenAi,
+        "custom-openai" => api::ProviderConfigKind::CustomOpenAi,
+        "dashscope" => api::ProviderConfigKind::DashScope,
+        other => {
+            return Err(format!(
+                "invalid provider configuration: unsupported provider kind `{other}`"
+            )
+            .into());
+        }
+    };
+
+    Ok(Some(api::ProviderConfig {
+        kind,
+        model: provider.model().unwrap_or_default().to_string(),
+        api_key: provider.api_key().map(str::to_string),
+        base_url: provider.base_url().map(str::to_string),
+    }))
+}
+
+fn explicit_provider_kind_for_model(
+    model: &str,
+    persisted_model: &str,
+) -> Option<api::ProviderConfigKind> {
+    let resolved_model = api::resolve_model_alias(model);
+    let persisted_resolved = api::resolve_model_alias(persisted_model);
+
+    if resolved_model.eq_ignore_ascii_case(&persisted_resolved) {
+        return None;
+    }
+
+    let namespace = model
+        .trim()
+        .split_once('/')
+        .map(|(namespace, _)| namespace.to_ascii_lowercase());
+
+    match namespace.as_deref() {
+        Some("anthropic") => Some(api::ProviderConfigKind::Anthropic),
+        Some("xai") => Some(api::ProviderConfigKind::Xai),
+        Some("openai") | Some("local") => Some(api::ProviderConfigKind::OpenAi),
+        Some("custom-openai") => Some(api::ProviderConfigKind::CustomOpenAi),
+        Some("dashscope") | Some("qwen") | Some("kimi") => Some(api::ProviderConfigKind::DashScope),
+        _ => {
+            let lower = resolved_model.to_ascii_lowercase();
+            if lower.starts_with("qwen/")
+                || lower.starts_with("qwen-")
+                || lower.starts_with("kimi/")
+                || lower.starts_with("kimi-")
+            {
+                Some(api::ProviderConfigKind::DashScope)
+            } else if lower.starts_with("grok/") || lower.starts_with("grok-") {
+                Some(api::ProviderConfigKind::Xai)
+            } else if lower.starts_with("claude") || lower.starts_with("anthropic/") {
+                Some(api::ProviderConfigKind::Anthropic)
+            } else if lower.starts_with("openai/")
+                || lower.starts_with("gpt-")
+                || lower.starts_with("local/")
+            {
+                Some(api::ProviderConfigKind::OpenAi)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -12546,10 +13191,12 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    turn_interrupt_signal: Option<runtime::TurnInterruptSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -12558,50 +13205,69 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         emit_output: bool,
+        terminal_tail: TerminalTail,
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        provider_config: Option<api::ProviderConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
+        // Explicit persisted provider configuration takes precedence.
+        // When absent, preserve the existing model-based provider detection.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
+        let provider_config = provider_config.map(|config| {
+            if let Some(kind) = explicit_provider_kind_for_model(&model, config.model.as_str()) {
+                api::ProviderConfig {
+                    kind,
+                    model: resolved_model.clone(),
+                    ..config
+                }
+            } else {
+                config
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        });
+        let client = if let Some(config) = provider_config {
+            match config.kind {
+                api::ProviderConfigKind::Anthropic => {
+                    let auth = match resolve_cli_auth_source() {
+                        Ok(auth) => auth,
+                        Err(_) => {
+                            config
+                                .api_key
+                                .clone()
+                                .map(AuthSource::ApiKey)
+                                .ok_or_else(|| {
+                                    api::ApiError::missing_credentials(
+                                        "Anthropic",
+                                        &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                                    )
+                                })?
+                        }
+                    };
+                    let mut inner = AnthropicClient::from_auth(auth);
+                    let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| config.base_url.clone())
+                        .unwrap_or_else(api::read_base_url);
+                    inner = inner.with_base_url(base_url);
+                    ApiProviderClient::Anthropic(
+                        inner.with_prompt_cache(PromptCache::new(session_id)),
+                    )
+                }
+                _ => ApiProviderClient::from_config(&config)?,
+            }
+        } else {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
             }
         };
         Ok(Self {
@@ -12611,15 +13277,21 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             emit_output,
+            terminal_tail,
             allowed_tools,
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            turn_interrupt_signal: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_turn_interrupt_signal(&mut self, signal: runtime::TurnInterruptSignal) {
+        self.turn_interrupt_signal = Some(signal);
     }
 }
 
@@ -12632,6 +13304,16 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
+fn model_supports_local_tools(model: &str) -> bool {
+    !matches!(
+        api::resolve_model_alias(model)
+            .rsplit('/')
+            .next()
+            .unwrap_or(model),
+        "compound" | "compound-mini"
+    )
+}
+
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -12639,45 +13321,65 @@ impl ApiClient for AnthropicRuntimeClient {
             progress_reporter.mark_model_phase();
         }
         let is_post_tool = request_ends_with_tool_result(&request);
+        let enable_local_tools = self.enable_tools && model_supports_local_tools(&self.model);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
+            tools: enable_local_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
-            tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            tool_choice: enable_local_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
 
         self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let request_loop = async {
+                // When resuming after tool execution, apply a stall timeout on the
+                // first stream event.  If the model does not respond within the
+                // deadline we drop the stalled connection and re-send the request as
+                // a continuation nudge (one retry only).
+                let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
+                for attempt in 1..=max_attempts {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        Err(error)
+                            if error.to_string().contains("post-tool stall")
+                                && attempt < max_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the model by
+                            // re-sending the same request.
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                }
+
+                Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            };
+
+            let Some(interrupt) = self.turn_interrupt_signal.clone() else {
+                return request_loop.await;
+            };
+
+            tokio::select! {
+                result = request_loop => result,
+                () = async {
+                    while !interrupt.is_interrupted() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => {
+                    // Dropping the request future aborts the in-flight HTTP
+                    // stream. The conversation loop sees the interrupt flag and
+                    // reports this as an interruption rather than a failure.
+                    Err(RuntimeError::new("request interrupted by user"))
                 }
             }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
@@ -12700,8 +13402,9 @@ impl AnthropicRuntimeClient {
             })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
+        let mut tracked = TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
         let out: &mut dyn Write = if self.emit_output {
-            &mut stdout
+            &mut tracked
         } else {
             &mut sink
         };
@@ -13865,6 +14568,7 @@ fn prompt_cache_record_to_runtime_event(
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
+    terminal_tail: TerminalTail,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -13874,12 +14578,14 @@ impl CliToolExecutor {
     fn new(
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
+        terminal_tail: TerminalTail,
         tool_registry: GlobalToolRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
+            terminal_tail,
             allowed_tools,
             tool_registry,
             mcp_state,
@@ -13973,8 +14679,11 @@ impl ToolExecutor for CliToolExecutor {
             Ok(output) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
+                    let mut stdout = io::stdout();
+                    let mut tracked =
+                        TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
                     self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
+                        .stream_markdown(&markdown, &mut tracked)
                         .map_err(|error| ToolError::new(error.to_string()))?;
                 }
                 Ok(output)
@@ -13982,8 +14691,11 @@ impl ToolExecutor for CliToolExecutor {
             Err(error) => {
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
+                    let mut stdout = io::stdout();
+                    let mut tracked =
+                        TailTrackingWriter::new(&mut stdout, self.terminal_tail.clone());
                     self.renderer
-                        .stream_markdown(&markdown, &mut io::stdout())
+                        .stream_markdown(&markdown, &mut tracked)
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
                 }
                 Err(error)
@@ -14298,8 +15010,8 @@ mod tests {
         CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        SessionLifecycleSummary, SlashCommand, StatusUsage, TerminalTail, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -14319,6 +15031,37 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    /// Snapshot-restore guard for a single environment variable.
+    /// Captures the original value on construction, applies the override,
+    /// and restores on drop so tests leave the process env untouched.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
@@ -19178,6 +19921,174 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn explicit_model_provider_hint_overrides_persisted_provider_kind() {
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        assert_eq!(
+            super::explicit_provider_kind_for_model("openai/gpt-5", &config.model),
+            Some(api::ProviderConfigKind::OpenAi)
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model("custom-openai/local-model", &config.model),
+            Some(api::ProviderConfigKind::CustomOpenAi)
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model("CUSTOM-OPENAI/local-model", &config.model),
+            Some(api::ProviderConfigKind::CustomOpenAi)
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model(
+                "custom-openai/local-model",
+                "custom-openai/local-model"
+            ),
+            None,
+            "matching custom model must keep the persisted provider kind"
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model("qwen-plus", &config.model),
+            None,
+            "matching persisted model must keep the persisted provider kind"
+        );
+    }
+
+    #[test]
+    fn explicit_model_provider_hint_controls_runtime_provider_dispatch() {
+        let _openai_base_url = EnvVarGuard::unset("OPENAI_BASE_URL");
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        let runtime = super::AnthropicRuntimeClient::new(
+            "provider-resolution-explicit-model-test",
+            "openai/gpt-5".to_string(),
+            false,
+            false,
+            TerminalTail::new(),
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+            Some(config),
+        )
+        .expect("runtime client should construct from explicit model provider hint");
+
+        match runtime.client {
+            api::ProviderClient::OpenAi(client) => {
+                assert!(client.base_url().contains("api.openai.com"));
+                assert!(!client.base_url().contains("dashscope.aliyuncs.com"));
+            }
+            other => panic!(
+                "explicit OpenAI model prefix must override persisted DashScope configuration, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn persisted_custom_openai_configuration_survives_runtime_boundary() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "provider": {
+                "kind": "custom-openai",
+                "apiKey": "custom-test-key",
+                "baseUrl": "https://custom.example/v1",
+                "model": "local-model"
+              },
+              "model": "local-model"
+            }"#,
+        )
+        .expect("write provider settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let provider_config = super::provider_config_from_runtime(runtime_config.provider())
+            .expect("custom provider configuration should adapt")
+            .expect("persisted provider configuration should be present");
+
+        assert_eq!(provider_config.kind, api::ProviderConfigKind::CustomOpenAi);
+        assert_eq!(provider_config.model, "local-model");
+        assert_eq!(provider_config.api_key.as_deref(), Some("custom-test-key"));
+        assert_eq!(
+            provider_config.base_url.as_deref(),
+            Some("https://custom.example/v1")
+        );
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn persisted_provider_configuration_controls_runtime_provider_dispatch() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "provider": {
+                "kind": "dashscope",
+                "apiKey": "persisted-test-key",
+                "baseUrl": "https://dashscope.example/v1",
+                "model": "qwen-plus"
+              },
+              "model": "qwen-plus"
+            }"#,
+        )
+        .expect("write provider settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+
+        let provider_config = super::provider_config_from_runtime(state.feature_config.provider())
+            .expect("provider configuration should adapt")
+            .expect("persisted provider configuration should be present");
+
+        assert_eq!(
+            provider_config.kind,
+            api::ProviderConfigKind::DashScope,
+            "persisted provider kind must survive the runtime configuration boundary"
+        );
+
+        let runtime = super::AnthropicRuntimeClient::new(
+            "provider-resolution-test",
+            "qwen-plus".to_string(),
+            false,
+            false,
+            TerminalTail::new(),
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+            Some(provider_config),
+        )
+        .expect("runtime client should construct from persisted provider configuration");
+
+        match runtime.client {
+            api::ProviderClient::OpenAi(_) => {}
+            other => panic!(
+                "persisted DashScope configuration must dispatch to the OpenAI-compatible client, got {other:?}"
+            ),
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         let config_home = temp_dir();
@@ -19222,6 +20133,7 @@ UU conflicted.rs",
         let mut executor = CliToolExecutor::new(
             None,
             false,
+            TerminalTail::new(),
             state.tool_registry.clone(),
             state.mcp_state.clone(),
         );
@@ -19320,6 +20232,7 @@ UU conflicted.rs",
         let mut executor = CliToolExecutor::new(
             None,
             false,
+            TerminalTail::new(),
             state.tool_registry.clone(),
             state.mcp_state.clone(),
         );
@@ -19380,6 +20293,7 @@ UU conflicted.rs",
             vec!["test system prompt".to_string()],
             true,
             false,
+            TerminalTail::new(),
             None,
             PermissionMode::DangerFullAccess,
             None,
@@ -19443,6 +20357,14 @@ UU conflicted.rs",
                 assert_eq!(reasoning_effort.as_deref(), Some(value));
             }
         }
+    }
+
+    #[test]
+    fn groq_compound_disables_local_tools() {
+        assert!(!super::model_supports_local_tools("groq/compound"));
+        assert!(!super::model_supports_local_tools("groq/compound-mini"));
+        assert!(super::model_supports_local_tools("sonnet"));
+        assert!(super::model_supports_local_tools("llama-3.1-8b-instant"));
     }
 
     #[test]
@@ -19835,5 +20757,38 @@ mod alias_resolution_tests {
         assert!(validate_model_syntax("qwen3.6:27b-nvfp4").is_ok());
         // Empty model still rejected
         assert!(validate_model_syntax("").is_err());
+    }
+
+    #[test]
+    fn local_openai_base_url_bypasses_bare_model_names() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        // LM Studio's default port; a bare alias with no dot/colon/slash,
+        // as LM Studio and llama.cpp commonly register models under.
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1");
+        assert!(validate_model_syntax("mistral").is_ok());
+        assert!(validate_model_syntax("local-7b").is_ok());
+        // Empty model is still rejected even when the base URL is local.
+        assert!(validate_model_syntax("").is_err());
+    }
+
+    #[test]
+    fn private_network_openai_base_url_bypasses_bare_model_names() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "http://192.168.1.50:8000/v1");
+        assert!(validate_model_syntax("mistral").is_ok());
+    }
+
+    #[test]
+    fn remote_openai_base_url_still_requires_provider_model_or_tag_syntax() {
+        let _guard = ollama_env_lock();
+        let _ollama_env = EnvVarGuard::unset("OLLAMA_HOST");
+        let _openai_env = EnvVarGuard::set("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+        // A bare name with no dot/colon/slash against a remote gateway must
+        // keep failing so a typo doesn't silently route to a paid hosted API.
+        assert!(validate_model_syntax("mistral").is_err());
+        // The existing dot/colon-tag heuristic still applies for remote hosts.
+        assert!(validate_model_syntax("qwen2.5-coder:7b").is_ok());
     }
 }

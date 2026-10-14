@@ -8,10 +8,16 @@ unless a maintainer explicitly marks them as supported.
 
 ## Reporting a vulnerability
 
-Please do **not** open a public issue for a suspected vulnerability. Use GitHub
-private vulnerability reporting for `ultraworkers/claw-code` when available, or
-contact a maintainer through the repository's published support channel with a
-minimal, non-destructive reproduction.
+Please do **not** open a public issue for a suspected vulnerability. Use [GitHub
+Security Advisories](https://docs.github.com/en/code-security/security-advisories)
+for `ultraworkers/claw-code`:
+
+1. Go to the **Security** tab of this repository
+2. Click **"Report a vulnerability"**
+3. Describe the issue with reproduction steps and impact
+
+Alternatively, contact a maintainer through the repository's published support
+channel with a minimal, non-destructive reproduction.
 
 Include:
 

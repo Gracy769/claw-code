@@ -270,6 +270,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // Groq compound systems and Groq-namespaced model ids are served through
+    // the OpenAI-compatible transport selected by OPENAI_BASE_URL.
+    if canonical.starts_with("groq/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -666,11 +676,26 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
+        // Groq Llama 4 models accept tool calling but cap completions below
+        // Claw's 64k fallback heuristic. Encode the provider limit so prompts
+        // fit inside Groq's request validation and TPM budget.
+        "llama-4-scout-17b-16e-instruct" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
         "qwen-max" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
         "qwen-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        // Groq compound systems are exposed through an OpenAI-compatible API
+        // but cap completions at 8,192 output tokens. Without this metadata
+        // Claw uses its 64k fallback heuristic and the provider rejects the
+        // request before generation starts.
+        "compound" | "compound-mini" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
             context_window_tokens: 131_072,
         }),
@@ -902,6 +927,135 @@ mod tests {
         assert_eq!(resolve_model_alias("grok-2"), "grok-2");
     }
 
+    /// Collects every non-empty backtick-delimited span in a markdown cell.
+    fn backticked(cell: &str) -> Vec<&str> {
+        let mut spans = Vec::new();
+        let mut rest = cell;
+        while let Some(start) = rest.find('`') {
+            let after_open = &rest[start + 1..];
+            let Some(end) = after_open.find('`') else {
+                break;
+            };
+            spans.push(&after_open[..end]);
+            rest = &after_open[end + 1..];
+        }
+        spans
+    }
+
+    // Locks the `## Model Aliases` table in `rust/README.md` to the resolver.
+    //
+    // The table and the alias set must agree in *both* directions: no alias may
+    // resolve without being documented, and none may be documented without
+    // resolving. The table previously listed only the three Anthropic aliases
+    // while the resolver had grown xAI and Kimi entries, so an alias could work
+    // undocumented — exactly the drift a parity test catches and a hand-written
+    // `assert_eq!` per alias does not.
+    #[test]
+    fn readme_alias_table_matches_resolver() {
+        // `rust/crates/api/src/providers/mod.rs` -> `rust/README.md`.
+        const README: &str = include_str!("../../../../README.md");
+
+        let section = README
+            .split("## Model Aliases")
+            .nth(1)
+            .expect("rust/README.md must keep a `## Model Aliases` section");
+        let section = section.split("\n## ").next().unwrap_or(section);
+
+        // (alias, documented canonical id, documented auth env var)
+        let mut documented: Vec<(String, String, String)> = Vec::new();
+        for line in section.lines() {
+            let line = line.trim();
+            let Some(row) = line.strip_prefix('|') else {
+                continue;
+            };
+            let cells: Vec<&str> = row
+                .trim_end_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect();
+            if cells.len() < 4 {
+                continue;
+            }
+            let aliases = backticked(cells[0]);
+            if aliases.is_empty() {
+                // Header and `|---|---|` separator rows carry no aliases.
+                continue;
+            }
+            let canonicals = backticked(cells[1]);
+            assert_eq!(
+                canonicals.len(),
+                1,
+                "`{line}` must document exactly one canonical model id"
+            );
+            let auth_envs = backticked(cells[3]);
+            assert_eq!(
+                auth_envs.len(),
+                1,
+                "`{line}` must document exactly one auth env var"
+            );
+            for alias in aliases {
+                documented.push((
+                    alias.to_string(),
+                    canonicals[0].to_string(),
+                    auth_envs[0].to_string(),
+                ));
+            }
+        }
+
+        assert!(
+            !documented.is_empty(),
+            "parsed no alias rows out of the `## Model Aliases` table in rust/README.md"
+        );
+
+        for (alias, canonical, auth_env) in &documented {
+            let resolved = resolve_model_alias(alias);
+            assert_eq!(
+                resolved.as_str(),
+                canonical.as_str(),
+                "rust/README.md documents `{alias}` -> `{canonical}`, but resolve_model_alias returns `{resolved}`"
+            );
+            assert_eq!(
+                resolve_model_alias(&alias.to_ascii_uppercase()).as_str(),
+                resolved.as_str(),
+                "rust/README.md claims alias resolution is case-insensitive, but `{}` disagrees with `{alias}`",
+                alias.to_ascii_uppercase()
+            );
+            let metadata = super::metadata_for_model(&resolved).unwrap_or_else(|| {
+                panic!("no provider metadata for documented model `{canonical}`")
+            });
+            assert_eq!(
+                metadata.auth_env,
+                auth_env.as_str(),
+                "rust/README.md documents `{alias}` as needing `{auth_env}`, but `{canonical}` resolves to provider metadata with auth env `{}`",
+                metadata.auth_env
+            );
+        }
+
+        let documented_aliases: std::collections::BTreeSet<&str> = documented
+            .iter()
+            .map(|(alias, _, _)| alias.as_str())
+            .collect();
+        let resolver_aliases: std::collections::BTreeSet<&str> = super::MODEL_REGISTRY
+            .iter()
+            .map(|(alias, _)| *alias)
+            .collect();
+        assert_eq!(
+            documented_aliases, resolver_aliases,
+            "rust/README.md's `## Model Aliases` table and MODEL_REGISTRY have drifted apart"
+        );
+    }
+
+    // The table documents bare short names only, so the provider-prefixed form
+    // is deliberately *not* an alias. This pins that distinction, since the
+    // prefix is handled later (at request-build time) and a future refactor
+    // could easily fold it into alias resolution.
+    #[test]
+    fn provider_prefixed_alias_is_not_an_alias() {
+        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-7");
+        assert_eq!(resolve_model_alias("anthropic/opus"), "anthropic/opus");
+        assert_eq!(resolve_model_alias("xai/grok"), "xai/grok");
+    }
+
     #[test]
     fn detects_provider_from_model_name_first() {
         assert_eq!(detect_provider_kind("grok"), ProviderKind::Xai);
@@ -1077,6 +1231,18 @@ mod tests {
         assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
 
         let kind = detect_provider_kind("local/Qwen/Qwen3.6-27B-FP8");
+        assert_eq!(kind, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn groq_prefix_routes_to_openai_not_anthropic() {
+        let meta = super::metadata_for_model("groq/compound")
+            .expect("groq/ prefix must resolve to OpenAI-compatible metadata");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "OPENAI_API_KEY");
+        assert_eq!(meta.base_url_env, "OPENAI_BASE_URL");
+
+        let kind = detect_provider_kind("groq/compound");
         assert_eq!(kind, ProviderKind::OpenAi);
     }
 
@@ -1377,6 +1543,27 @@ mod tests {
             alias_limit.context_window_tokens,
             direct_limit.context_window_tokens
         );
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_groq_compound_models() {
+        let compound =
+            model_token_limit("groq/compound").expect("groq/compound should have token limits");
+        assert_eq!(compound.max_output_tokens, 8_192);
+        assert_eq!(compound.context_window_tokens, 131_072);
+
+        let compound_mini = model_token_limit("groq/compound-mini")
+            .expect("groq/compound-mini should have token limits");
+        assert_eq!(compound_mini.max_output_tokens, 8_192);
+        assert_eq!(compound_mini.context_window_tokens, 131_072);
+    }
+
+    #[test]
+    fn returns_context_window_metadata_for_groq_llama4_scout() {
+        let scout = model_token_limit("groq/meta-llama/llama-4-scout-17b-16e-instruct")
+            .expect("groq llama 4 scout should have token limits");
+        assert_eq!(scout.max_output_tokens, 8_192);
+        assert_eq!(scout.context_window_tokens, 131_072);
     }
 
     #[test]

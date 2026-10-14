@@ -7,7 +7,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+use mock_anthropic_service::{
+    MockAnthropicService, CONTEXT_WINDOW_RETRY_TEXT, SCENARIO_PREFIX, STREAM_THEN_ERROR_TEXT,
+};
 use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -184,6 +186,199 @@ fn text_prompt_mode_streams_assistant_text_once_before_spinner_completion() {
     assert!(
         plain_stdout.find(assistant_text) < plain_stdout.find("✔ ✨ Done"),
         "text prompt stdout should stream the assistant text before spinner completion ({stdout:?})"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn text_prompt_mode_emits_the_response_body_exactly_once() {
+    // given a workspace pointed at the mock Anthropic service running the
+    // streaming_text scenario, which emits a single assistant text block
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("text-prompt-once");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    // when we invoke claw in normal text prompt mode
+    let prompt = format!("{SCENARIO_PREFIX}streaming_text");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            &prompt,
+        ],
+    );
+
+    // then the response body reaches stdout exactly once: the emitter owns the
+    // terminal while the turn runs, so the caller must not print the assistant
+    // text a second time
+    assert!(
+        output.status.success(),
+        "text prompt run should succeed\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let plain_stdout = strip_ansi_codes(&stdout);
+    assert_eq!(
+        plain_stdout
+            .matches("Mock streaming says hello from the parity harness.")
+            .count(),
+        1,
+        "text prompt stdout should carry the response body exactly once ({stdout:?})"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn text_prompt_mode_emits_retried_body_once_after_auto_compact() {
+    // given a mock service whose first answer to this scenario is a context
+    // window rejection and whose answer to the retry is a streamed response
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("text-prompt-auto-compact-retry");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    // when claw is rejected for context window overflow and recovers by
+    // compacting the session and retrying the same prompt
+    let prompt = format!("{SCENARIO_PREFIX}context_window_retry");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            &prompt,
+        ],
+    );
+
+    // then the retry succeeds and its response body is on stdout exactly once.
+    // The recovery path builds a fresh runtime with its own terminal tail, so
+    // this is where a tail that only tracked the first attempt would leave the
+    // streamed line unterminated and let `spinner.finish` clear it.
+    assert!(
+        output.status.success(),
+        "auto-compact retry should succeed\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let plain_stdout = strip_ansi_codes(&stdout);
+    assert_eq!(
+        plain_stdout.matches(CONTEXT_WINDOW_RETRY_TEXT).count(),
+        1,
+        "auto-compact retry stdout should carry the response body exactly once ({stdout:?})"
+    );
+    assert!(
+        plain_stdout
+            .lines()
+            .any(|line| line == CONTEXT_WINDOW_RETRY_TEXT),
+        "the retried response body should land on its own line ({stdout:?})"
+    );
+    assert!(
+        plain_stdout.contains("✨ Done (after auto-compact)"),
+        "the retry should report the auto-compact completion ({stdout:?})"
+    );
+
+    // and the scenario really was requested twice, so the retry path ran
+    let captured = runtime.block_on(server.captured_requests());
+    let messages: Vec<_> = captured
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .collect();
+    assert!(
+        messages.len() >= 2,
+        "the scenario should be requested twice so the retry is exercised ({captured:?})"
+    );
+
+    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+#[test]
+fn text_prompt_mode_keeps_streamed_text_when_the_turn_fails() {
+    // given a mock service that streams part of an answer and then fails the
+    // response, so the turn ends with text already rendered on the terminal
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+
+    let workspace = unique_temp_dir("text-prompt-stream-then-error");
+    let config_home = workspace.join("config-home");
+    let home = workspace.join("home");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+
+    // when the turn fails after the emitter already streamed a partial line
+    let prompt = format!("{SCENARIO_PREFIX}stream_then_error");
+    let output = run_claw(
+        &workspace,
+        &config_home,
+        &home,
+        &base_url,
+        &[
+            "--model",
+            "sonnet",
+            "--permission-mode",
+            "read-only",
+            &prompt,
+        ],
+    );
+
+    // then the failed turn is reported...
+    assert!(
+        !output.status.success(),
+        "a mid-stream failure should fail the run\nstdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let plain_stdout = strip_ansi_codes(&stdout);
+
+    // ...and the text the emitter already streamed survives the failure banner.
+    // `spinner.fail` moves to column 0 and clears the current line, so a caller
+    // that does not know a partial line is pending erases that text instead of
+    // printing the banner underneath it. This is the failure arm of the same
+    // ownership rule the success arm follows.
+    assert!(
+        plain_stdout
+            .lines()
+            .any(|line| line == STREAM_THEN_ERROR_TEXT),
+        "the streamed text should keep its own line despite the failure ({stdout:?})"
+    );
+    assert!(
+        plain_stdout.contains("Request failed"),
+        "the failure banner should still be reported ({stdout:?})"
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");

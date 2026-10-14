@@ -42,6 +42,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const CUSTOM_OPENAI_ENV_VARS: &[&str] = &["CLAWCUSTOMOPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 
 // Provider-specific request body size limits in bytes
@@ -80,6 +81,18 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// OpenAI-compatible endpoint with its own environment namespace and no default URL.
+    #[must_use]
+    pub const fn custom_openai() -> Self {
+        Self {
+            provider_name: "Custom OpenAI",
+            api_key_env: "CLAWCUSTOMOPENAI_API_KEY",
+            base_url_env: "CLAWCUSTOMOPENAI_BASE_URL",
+            default_base_url: "",
+            max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
     /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
     /// Requested via Discord #clawcode-get-help: native Alibaba API for
@@ -100,6 +113,7 @@ impl OpenAiCompatConfig {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Custom OpenAI" => CUSTOM_OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
             _ => &[],
         }
@@ -1027,7 +1041,12 @@ fn url_host(url: &str) -> &str {
     host_port.split(':').next().unwrap_or("")
 }
 
-fn is_local_openai_compatible_base_url(url: &str) -> bool {
+/// Returns true when `url`'s host is loopback or a private-network address
+/// (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `172.16-31.x`). Used to
+/// waive auth requirements for local OpenAI-compatible servers (Ollama, LM
+/// Studio, llama.cpp, vLLM) that don't expect a real API key.
+#[must_use]
+pub fn is_local_openai_compatible_base_url(url: &str) -> bool {
     let host = url_host(url.trim());
     if host.eq_ignore_ascii_case("localhost") || host == "::1" {
         return true;

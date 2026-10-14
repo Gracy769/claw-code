@@ -163,6 +163,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    auto_memory_enabled: bool,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -204,6 +205,11 @@ pub struct RuntimeProviderConfig {
 }
 
 impl RuntimeProviderConfig {
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.kind.is_some()
+    }
+
     #[must_use]
     pub fn kind(&self) -> Option<&str> {
         self.kind.as_deref()
@@ -466,31 +472,39 @@ impl ConfigLoader {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
         let mut mcp = McpConfigCollection::default();
-        let mut all_warnings = Vec::new();
+        let mut all_warnings: Vec<String> = Vec::new();
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
             let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
-            let validation = crate::config_validate::validate_config_file(
-                &parsed.object,
-                &parsed.source,
-                &entry.path,
-            );
+            let ParsedConfigFile { mut object, source } = parsed;
+            if let Some(warning) =
+                strip_untrusted_project_hooks(entry.source, &mut object, &entry.path)
+            {
+                all_warnings.push(warning);
+            }
+            let validation =
+                crate::config_validate::validate_config_file(&object, &source, &entry.path);
             if !validation.is_ok() {
                 let first_error = &validation.errors[0];
                 return Err(ConfigError::Parse(first_error.to_string()));
             }
-            all_warnings.extend(validation.warnings);
-            validate_optional_hooks_config(&parsed.object, &entry.path)?;
-            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
-            deep_merge_objects(&mut merged, &parsed.object);
+            all_warnings.extend(
+                validation
+                    .warnings
+                    .into_iter()
+                    .map(|warning| warning.to_string()),
+            );
+            validate_optional_hooks_config(&object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &object, &entry.path)?;
+            deep_merge_objects(&mut merged, &object);
             loaded_entries.push(entry);
         }
 
         for warning in &all_warnings {
-            emit_config_warning_once(&warning.to_string());
+            emit_config_warning_once(warning);
         }
 
         build_runtime_config(merged, loaded_entries, mcp)
@@ -512,19 +526,22 @@ impl ConfigLoader {
             let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
-            let validation = crate::config_validate::validate_config_file(
-                &parsed.object,
-                &parsed.source,
-                &entry.path,
-            );
+            let ParsedConfigFile { mut object, source } = parsed;
+            if let Some(warning) =
+                strip_untrusted_project_hooks(entry.source, &mut object, &entry.path)
+            {
+                all_warnings.push(warning);
+            }
+            let validation =
+                crate::config_validate::validate_config_file(&object, &source, &entry.path);
             if !validation.is_ok() {
                 let first_error = &validation.errors[0];
                 return Err(ConfigError::Parse(first_error.to_string()));
             }
             all_warnings.extend(validation.warnings.iter().map(|w| w.to_string()));
-            validate_optional_hooks_config(&parsed.object, &entry.path)?;
-            merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
-            deep_merge_objects(&mut merged, &parsed.object);
+            validate_optional_hooks_config(&object, &entry.path)?;
+            merge_mcp_servers(&mut mcp, entry.source, &object, &entry.path)?;
+            deep_merge_objects(&mut merged, &object);
             loaded_entries.push(entry);
         }
 
@@ -589,11 +606,14 @@ impl ConfigLoader {
                 }
             };
 
-            let validation = crate::config_validate::validate_config_file(
-                &parsed.object,
-                &parsed.source,
-                &entry.path,
-            );
+            let ParsedConfigFile { mut object, source } = parsed;
+            if let Some(warning) =
+                strip_untrusted_project_hooks(entry.source, &mut object, &entry.path)
+            {
+                warnings.push(warning);
+            }
+            let validation =
+                crate::config_validate::validate_config_file(&object, &source, &entry.path);
             if !validation.is_ok() {
                 let detail = validation.errors[0].to_string();
                 load_error.get_or_insert_with(|| detail.clone());
@@ -612,7 +632,7 @@ impl ConfigLoader {
                     .map(|warning| warning.to_string()),
             );
 
-            if let Err(error) = validate_optional_hooks_config(&parsed.object, &entry.path) {
+            if let Err(error) = validate_optional_hooks_config(&object, &entry.path) {
                 let detail = error.to_string();
                 load_error.get_or_insert_with(|| detail.clone());
                 files.push(ConfigFileReport::load_error(
@@ -624,9 +644,7 @@ impl ConfigLoader {
                 continue;
             }
 
-            if let Err(error) =
-                merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)
-            {
+            if let Err(error) = merge_mcp_servers(&mut mcp, entry.source, &object, &entry.path) {
                 let detail = error.to_string();
                 load_error.get_or_insert_with(|| detail.clone());
                 files.push(ConfigFileReport::load_error(
@@ -638,8 +656,8 @@ impl ConfigLoader {
                 continue;
             }
 
-            let key_paths = collect_config_key_paths(&parsed.object);
-            deep_merge_objects(&mut merged, &parsed.object);
+            let key_paths = collect_config_key_paths(&object);
+            deep_merge_objects(&mut merged, &object);
             loaded_entries.push(entry.clone());
             files.push(ConfigFileReport::loaded(entry, precedence_rank, key_paths));
         }
@@ -660,6 +678,23 @@ impl ConfigLoader {
             warnings,
             load_error,
         }
+    }
+}
+
+fn strip_untrusted_project_hooks(
+    source: ConfigSource,
+    object: &mut BTreeMap<String, JsonValue>,
+    path: &Path,
+) -> Option<String> {
+    // Project settings come from the repository and there is no project-hook
+    // trust approval flow yet. User and local settings remain eligible.
+    if source == ConfigSource::Project && object.remove("hooks").is_some() {
+        Some(format!(
+            "Ignoring project hooks in {} because project-hook trust approval is not supported.",
+            path.display()
+        ))
+    } else {
+        None
     }
 }
 
@@ -801,6 +836,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        auto_memory_enabled: parse_auto_memory_enabled(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -826,7 +862,10 @@ impl RuntimeConfig {
         Self {
             merged: BTreeMap::new(),
             loaded_entries: Vec::new(),
-            feature_config: RuntimeFeatureConfig::default(),
+            feature_config: RuntimeFeatureConfig {
+                auto_memory_enabled: true,
+                ..RuntimeFeatureConfig::default()
+            },
         }
     }
 
@@ -1010,6 +1049,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn rules_import(&self) -> &RulesImportConfig {
         &self.rules_import
+    }
+
+    #[must_use]
+    pub fn auto_memory_enabled(&self) -> bool {
+        self.auto_memory_enabled
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -2172,6 +2216,13 @@ fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderCon
     })
 }
 
+fn parse_auto_memory_enabled(root: &JsonValue) -> bool {
+    root.as_object()
+        .and_then(|object| object.get("autoMemoryEnabled"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true)
+}
+
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -2590,6 +2641,7 @@ mod tests {
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
+    use crate::HookRunner;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2609,6 +2661,42 @@ mod tests {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("runtime-config-{pid}-{nanos}-{seq}"))
+    }
+
+    #[test]
+    fn loads_persisted_provider_configuration_from_settings() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+                "provider": {
+                    "kind": "dashscope",
+                    "apiKey": "persisted-test-key",
+                    "baseUrl": "https://dashscope.example/v1",
+                    "model": "qwen-plus"
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("provider configuration should load");
+
+        let provider = loaded.provider();
+
+        assert_eq!(provider.kind(), Some("dashscope"));
+        assert_eq!(provider.api_key(), Some("persisted-test-key"));
+        assert_eq!(provider.base_url(), Some("https://dashscope.example/v1"));
+        assert_eq!(provider.model(), Some("qwen-plus"));
+        assert!(provider.is_configured());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -2695,17 +2783,14 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PreToolUse"));
-        assert!(loaded
+        assert!(!loaded
             .get("hooks")
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PostToolUse"));
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
-        assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
-        assert_eq!(
-            loaded.hooks().post_tool_use_failure(),
-            &["project-failure".to_string()]
-        );
+        assert!(loaded.hooks().post_tool_use().is_empty());
+        assert!(loaded.hooks().post_tool_use_failure().is_empty());
         assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
         assert_eq!(
             loaded.permission_rules().deny(),
@@ -2714,6 +2799,73 @@ mod tests {
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn project_config_hooks_cannot_execute_commands() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let project_settings = cwd.join(".claw").join("settings.json");
+        let project_legacy_settings = cwd.join(".claw.json");
+        let marker = root.join("project-hook-executed");
+        fs::create_dir_all(project_settings.parent().expect("project config dir"))
+            .expect("create project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        let command = format!("echo compromised >> {}", marker.display());
+        fs::write(
+            &project_legacy_settings,
+            format!(r#"{{"hooks":{{"PreToolUse":["{command}"]}}}}"#),
+        )
+        .expect("write untrusted legacy project hook");
+        fs::write(
+            &project_settings,
+            format!(r#"{{"hooks":{{"PreToolUse":["{command}"]}}}}"#),
+        )
+        .expect("write untrusted project hook");
+
+        let loader = ConfigLoader::new(&cwd, &home);
+        let loaded = loader.load().expect("config should load");
+        let _ =
+            HookRunner::from_feature_config(loaded.feature_config()).run_pre_tool_use("Read", "{}");
+
+        let hook_executed = marker.exists();
+        if hook_executed {
+            fs::remove_file(&marker).expect("remove hook marker");
+        }
+        assert!(
+            !hook_executed,
+            "untrusted project hook executed arbitrary shell command"
+        );
+
+        let (collected, warnings) = loader
+            .load_collecting_warnings()
+            .expect("collecting config should load");
+        assert!(collected.hooks().pre_tool_use().is_empty());
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("Ignoring project hooks"))
+                .count(),
+            2
+        );
+        let inspected = loader.inspect_collecting_warnings();
+        assert_eq!(
+            inspected
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("Ignoring project hooks"))
+                .count(),
+            2
+        );
+        assert!(inspected
+            .runtime_config
+            .expect("inspection should produce runtime config")
+            .hooks()
+            .pre_tool_use()
+            .is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3523,7 +3675,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_valid_hook_entries_and_records_invalid_siblings_441() {
+    fn ignores_project_hook_entries_and_keeps_user_hooks_441() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -3547,22 +3699,8 @@ mod tests {
             .load()
             .expect("config should load valid hook entries and record invalid siblings");
 
-        // #106: arrays now concatenate across config layers, so both "base" and "project" are present
-        assert_eq!(
-            loaded.hooks().pre_tool_use(),
-            &["base".to_string(), "project".to_string()]
-        );
-        assert_eq!(loaded.hooks().invalid_count(), 1);
-        assert_eq!(loaded.hooks().invalid_hooks()[0].event, "PreToolUse");
-        assert_eq!(
-            loaded.hooks().invalid_hooks()[0].kind,
-            "invalid_hooks_config"
-        );
-        // #106: invalid entry at index 2 after array concatenation
-        assert_eq!(loaded.hooks().invalid_hooks()[0].index, Some(2));
-        assert!(loaded.hooks().invalid_hooks()[0]
-            .reason
-            .contains("must be a string or hook object"));
+        assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
+        assert!(loaded.hooks().invalid_hooks().is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

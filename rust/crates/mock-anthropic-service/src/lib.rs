@@ -13,6 +13,16 @@ use tokio::task::JoinHandle;
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// The assistant text the `context_window_retry` scenario finally streams, after
+/// its first request was refused with a context-overflow error. Exposed so a
+/// test can assert on the exact body instead of restating the literal.
+pub const CONTEXT_WINDOW_RETRY_TEXT: &str = "auto compact retry parity complete.";
+
+/// The partial assistant text the `stream_then_error` scenario streams before it
+/// fails the response mid-stream. Exposed so a test can assert on the exact body
+/// instead of restating the literal.
+pub const STREAM_THEN_ERROR_TEXT: &str = "partial response before the stream failed";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
     pub method: String,
@@ -99,6 +109,8 @@ enum Scenario {
     BashPermissionPromptDenied,
     PluginToolRoundtrip,
     AutoCompactTriggered,
+    ContextWindowRetry,
+    StreamThenError,
     TokenCostReporting,
 }
 
@@ -116,6 +128,8 @@ impl Scenario {
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
+            "context_window_retry" => Some(Self::ContextWindowRetry),
+            "stream_then_error" => Some(Self::StreamThenError),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             _ => None,
         }
@@ -134,6 +148,8 @@ impl Scenario {
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
+            Self::ContextWindowRetry => "context_window_retry",
+            Self::StreamThenError => "stream_then_error",
             Self::TokenCostReporting => "token_cost_reporting",
         }
     }
@@ -149,6 +165,18 @@ async fn handle_connection(
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
 
+    // How many times this scenario has already been served *on this endpoint*.
+    // Scenarios that need to behave differently on a retry (reject once, then
+    // succeed) key off this; counting per endpoint keeps the token-counting
+    // preflight on `/v1/messages/count_tokens` from consuming the first attempt.
+    let attempt = {
+        let served = requests.lock().await;
+        served
+            .iter()
+            .filter(|captured| captured.scenario == scenario.name() && captured.path == path)
+            .count()
+    };
+
     requests.lock().await.push(CapturedRequest {
         method,
         path,
@@ -158,7 +186,7 @@ async fn handle_connection(
         raw_body,
     });
 
-    let response = build_http_response(&request, scenario);
+    let response = build_http_response(&request, scenario, attempt);
     socket.write_all(response.as_bytes()).await?;
     Ok(())
 }
@@ -308,7 +336,11 @@ fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> Strin
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
+fn build_http_response(request: &MessageRequest, scenario: Scenario, attempt: usize) -> String {
+    if let Some(rejection) = context_window_rejection(scenario, attempt) {
+        return rejection;
+    }
+
     let response = if request.stream {
         let body = build_stream_body(request, scenario);
         return http_response(
@@ -327,6 +359,37 @@ fn build_http_response(request: &MessageRequest, scenario: Scenario) -> String {
         &serde_json::to_string(&response).expect("message response should serialize"),
         &[("request-id", request_id_for(scenario))],
     )
+}
+
+/// The first request of [`Scenario::ContextWindowRetry`] is refused with a
+/// context-overflow error instead of a streamed answer, so the client's
+/// auto-compact recovery path runs and the *retry* is what produces the
+/// response text. Every later request against the same endpoint succeeds.
+///
+/// HTTP 400 is deliberately chosen: it is not in the client's retryable status
+/// set, so the client surfaces the error rather than silently re-sending it —
+/// which is exactly the situation a real context-overflow rejection creates.
+/// The body carries the `context_window` marker the client greps for.
+fn context_window_rejection(scenario: Scenario, attempt: usize) -> Option<String> {
+    if scenario != Scenario::ContextWindowRetry || attempt > 0 {
+        return None;
+    }
+
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "prompt is too long: context_window exceeded for this model",
+        },
+    })
+    .to_string();
+
+    Some(http_response(
+        "400 Bad Request",
+        "application/json",
+        &body,
+        &[("request-id", request_id_for(scenario))],
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -461,6 +524,8 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::AutoCompactTriggered => {
             final_text_sse_with_usage("auto compact parity complete.", 50_000, 200)
         }
+        Scenario::ContextWindowRetry => final_text_sse(CONTEXT_WINDOW_RETRY_TEXT),
+        Scenario::StreamThenError => stream_then_error_sse(STREAM_THEN_ERROR_TEXT),
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
@@ -628,6 +693,12 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             50_000,
             200,
         ),
+        Scenario::ContextWindowRetry => {
+            text_message_response("msg_context_window_retry", CONTEXT_WINDOW_RETRY_TEXT)
+        }
+        Scenario::StreamThenError => {
+            text_message_response("msg_stream_then_error", STREAM_THEN_ERROR_TEXT)
+        }
         Scenario::TokenCostReporting => text_message_response_with_usage(
             "msg_token_cost_reporting",
             "token cost reporting parity complete.",
@@ -650,6 +721,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
+        Scenario::ContextWindowRetry => "req_context_window_retry",
+        Scenario::StreamThenError => "req_stream_then_error",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
     }
 }
@@ -968,6 +1041,84 @@ fn final_text_sse(text: &str) -> String {
         }),
     );
     append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body
+}
+
+/// Streams a text block to completion and then fails the response, which is
+/// what a provider does when it dies partway through an answer.
+///
+/// The block is closed before the failure on purpose: the client only flushes
+/// its buffered markdown to the terminal on `content_block_stop`, so without
+/// that frame the partial text would still be sitting in the renderer and the
+/// scenario would not reproduce a turn that streamed text and *then* errored.
+///
+/// The response is cut off in the middle of the failing frame rather than
+/// carrying a complete one. Two things fall out of that, both deliberate.
+///
+/// It is what a provider that dies on the socket actually looks like, and it
+/// keeps the failure in a *later* parser call than the answer text. The whole
+/// response is one `write_all` on the mock's side, so a complete trailing frame
+/// would land in the same read chunk as the deltas — and `SseParser::push`
+/// returns `Err` from inside its frame loop, which discards the events it had
+/// already parsed from that same chunk. The client would then never render the
+/// text at all, and the scenario would be exercising that parser behaviour
+/// instead of the terminal state it is meant to reproduce. A truncated tail
+/// stays in the parser's buffer, so `push` returns the deltas normally and the
+/// failure only surfaces from `finish()`, once the client has consumed every
+/// event ahead of it.
+///
+/// The failure is a frame that does not deserialize — `api::types::StreamEvent`
+/// is `#[serde(tag = "type")]` with no fallback arm, so an unknown frame type or
+/// a truncated payload is an `ApiError::Json`. That is non-retryable, and it is
+/// raised while reading the body rather than while acquiring the response, so the
+/// client reports it on the first attempt rather than retrying.
+fn stream_then_error_sse(text: &str) -> String {
+    let mut body = String::new();
+    append_sse(
+        &mut body,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": unique_message_id(),
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": DEFAULT_MODEL,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage_json(14, 0)
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 0}),
+    );
+    // No terminating blank line: the frame is still arriving when the provider
+    // drops the connection, so it stays in the client's parser buffer until the
+    // body ends. See the note above for why the failure has to trail the deltas
+    // by a parser call rather than sharing their chunk.
+    body.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_");
     body
 }
 

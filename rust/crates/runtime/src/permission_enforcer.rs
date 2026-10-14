@@ -81,8 +81,10 @@ impl PermissionEnforcer {
 
         let active_mode = self.policy.active_mode();
 
-        // Check if active mode meets the dynamically determined required mode
-        if active_mode >= required_mode {
+        // Check if active mode meets the dynamically determined required mode.
+        // Ranked explicitly: `PermissionMode` no longer derives `Ord`, so the
+        // ladder is a named function rather than declaration order.
+        if active_mode.privilege_rank() >= required_mode.privilege_rank() {
             return EnforcementResult::Allowed;
         }
 
